@@ -1,7 +1,7 @@
 ; Inno Setup script for depth.
 ;
-; There is a single, full setup (about 215 MB): English on Cactus Whistle plus the Indonesian
-; Whisper checkpoint and its runtime. Build it with:
+; There is a single, full offline setup: English on Cactus Whistle plus the Indonesian
+; Whisper final/draft checkpoints and runtime. Build it with:
 ;   .toolchain\innosetup\ISCC.exe installer\depth.iss
 ;     -> dist\depth-setup.exe
 ;
@@ -69,9 +69,11 @@ Source: "..\models\whistle.cact"; DestDir: "{app}\models"; Flags: ignoreversion
 Source: "..\vendor\needle\windows-x86_64\needle.exe"; DestDir: "{app}\vendor\needle\windows-x86_64"; \
     Flags: ignoreversion
 
-; Indonesian: the checkpoint plus its ggml runtime DLLs must stay side by side.
+; Indonesian: final and draft checkpoints plus the ggml runtime DLLs beside the CLI.
 ; The checkpoint is already quantised, so compressing it only wastes build time.
 Source: "..\models\ggml-small-q5_1.bin"; DestDir: "{app}\models"; \
+    Flags: ignoreversion nocompression
+Source: "..\models\ggml-base-q5_1.bin"; DestDir: "{app}\models"; \
     Flags: ignoreversion nocompression
 Source: "..\vendor\whisper\Release\whisper-cli.exe"; DestDir: "{app}\vendor\whisper"; \
     Flags: ignoreversion

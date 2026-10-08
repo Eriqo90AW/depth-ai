@@ -1,7 +1,7 @@
-; NSIS script for depth.
+﻿; NSIS script for depth.
 ;
-; There is a single, full setup (about 215 MB): English on Cactus Whistle plus the Indonesian
-; Whisper checkpoint and its runtime. Build it with (from the installer folder):
+; There is a single, full offline setup: English on Cactus Whistle plus the Indonesian
+; Whisper final/draft checkpoints and runtime. Build it with (from the installer folder):
 ;   ..\.toolchain\nsis\makensis.exe depth.nsi
 ;     -> ..\dist\depth-setup.exe
 ;
@@ -79,7 +79,7 @@ VIAddVersionKey "LegalCopyright" "Apache-2.0"
 
 ; ---------------------------------------------------------------- components
 
-Section "Application, English transcription (Whistle) and Indonesian transcription (Whisper small)" SEC_CORE
+Section "Application, English transcription and Indonesian transcription with live drafts" SEC_CORE
   SectionIn RO ; always installed
   SetOutPath "$INSTDIR"
   File "..\target\release\${APPEXE}"
@@ -89,9 +89,10 @@ Section "Application, English transcription (Whistle) and Indonesian transcripti
   File "..\models\whistle.cact"
   SetOutPath "$INSTDIR\vendor\needle\windows-x86_64"
   File "..\vendor\needle\windows-x86_64\needle.exe"
-  ; Indonesian: the checkpoint plus the ggml runtime DLLs beside the CLI.
+  ; Indonesian: final and draft checkpoints plus the ggml runtime DLLs beside the CLI.
   SetOutPath "$INSTDIR\models"
   File "..\models\ggml-small-q5_1.bin"
+  File "..\models\ggml-base-q5_1.bin"
   SetOutPath "$INSTDIR\vendor\whisper"
   File "..\vendor\whisper\Release\whisper-cli.exe"
   File "..\vendor\whisper\Release\*.dll"
@@ -153,7 +154,7 @@ Section -Registration
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "The application, the Cactus engine with the Whistle model for English, and Whisper small for Indonesian (about 215 MB)."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "The application, the Cactus engine with the Whistle model for English, and Whisper small plus base for Indonesian final results and live drafts."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} "Put a shortcut on every user's desktop."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTMENU} "Add entries to the all-users Start Menu."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTUP} "Launch when any user signs in. It starts idle and records nothing until the hotkey is pressed."
