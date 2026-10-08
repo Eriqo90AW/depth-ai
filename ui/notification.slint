@@ -1,0 +1,17 @@
+import { Palette, Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+export component NotificationWindow inherits Window {
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    title: "Depth completion"; width: 360px; height: 126px; no-frame: true; always-on-top: true;
+    icon: @image-url("../assets/icon/png/depth-256.png");
+    background: transparent; default-font-family: "Segoe UI Variable";
+    in property <string> message;
+    callback open-recording(); callback dismiss();
+    Rectangle { border-radius: 18px; background: Theme.glass; border-color: Theme.edge; border-width: 1px;
+        VerticalBox { padding: 16px; spacing: 12px;
+            Text { text: root.message; color: Theme.ink; wrap: word-wrap; font-weight: 600; }
+            HorizontalBox { Button { text: "Open recording"; primary: true; clicked => { root.open-recording(); } } Button { text: "Dismiss"; clicked => { root.dismiss(); } } }
+        }
+    }
+}
+

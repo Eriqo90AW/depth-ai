@@ -1,0 +1,57 @@
+[package]
+name = "depth"
+version = "0.1.1"
+edition = "2024"
+description = "Lightweight Windows tray app that transcribes desktop audio on-device"
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+windows-core = "0.62"
+directories = "6"
+hound = "3.5"
+rubato = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+whisper-rs = { version = "0.16", default-features = false, optional = true }
+tray-icon = { version = "0.21", optional = true }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-skia", "renderer-software", "compat-1-2", "unstable-winit-030", "accessibility"], optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+muda = { version = "0.17", optional = true }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Media", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Performance", "Win32_System_Variant", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+# Both speech engines default to running their vendor's prebuilt CLI, which needs no C++
+# toolchain: `whistle-sidecar` runs the Cactus needle.exe, `whisper-sidecar` runs
+# whisper.cpp's whisper-cli.exe. Both avoid native linking entirely.
+# `whistle` links libneedle.a in-process (needs libc++, which Visual Studio does not ship).
+# `whisper` compiles whisper.cpp in-process (needs CMake + a working whisper-rs build).
+default = ["whistle-sidecar", "whisper-sidecar", "tray"]
+whistle = []
+whistle-sidecar = []
+whisper = ["dep:whisper-rs"]
+whisper-sidecar = []
+tray = ["dep:tray-icon", "dep:muda", "dep:slint", "dep:raw-window-handle"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# The indicator lives in the library so both the tray and headless paths can use it.
+
+[build-dependencies]
+slint-build = "=1.18.1"
+
+
+
+
+
+[dev-dependencies]
+i-slint-backend-testing = { version = "=1.18.1", features = ["renderer-software"] }
+

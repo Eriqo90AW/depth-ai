@@ -1,0 +1,19 @@
+import { Palette } from "std-widgets.slint";
+export global Theme {
+    in-out property <bool> dark: false;
+    in-out property <bool> backdrop-supported: true;
+    changed dark => { Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light; }
+    in-out property <bool> reduced-motion: false;
+    in-out property <bool> reduced-transparency: false;
+    out property <color> ink: dark ? #eff3fb : #182338;
+    out property <color> muted: dark ? #a6b3ca : #64728a;
+    out property <color> panel: dark ? #1c2535 : #fcfdff;
+    out property <color> base: dark ? #101827 : #eaf0f9;
+    out property <color> glass: dark ? (reduced-transparency ? #172132 : #172132e8) : (reduced-transparency ? #f3f7fc : #f3f7fce8);
+    out property <color> edge: dark ? #ffffff18 : #ffffffcc;
+    out property <color> accent: dark ? #90b5ff : #3467c9;
+}
+
+
+
+

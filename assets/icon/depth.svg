@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="Depth">
+  <rect x="30.72" y="30.72" width="450.56" height="450.56" rx="108.13" fill="#FFFFFF"/>
+  <g fill="#000000">
+    <rect x="66.60" y="163.92" width="39.76" height="184.16" rx="19.88"/>
+    <rect x="129.39" y="138.81" width="39.76" height="234.39" rx="19.88"/>
+    <rect x="192.17" y="163.92" width="39.76" height="184.16" rx="19.88"/>
+  </g>
+  <text x="254.95" y="256.00" font-family="Arial, 'Segoe UI', sans-serif"
+        font-weight="700" font-size="47" text-anchor="start"
+        dominant-baseline="central" fill="#000000">DEPTH &#8226;</text>
+</svg>

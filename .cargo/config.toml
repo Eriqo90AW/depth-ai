@@ -1,0 +1,3 @@
+[env]
+# whisper-rs ships pre-generated bindings; using them avoids requiring libclang/LLVM to build.
+WHISPER_DONT_GENERATE_BINDINGS = "1"

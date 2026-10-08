@@ -1,0 +1,18 @@
+import { Theme } from "theme.slint";
+export component CaptionButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon-path;
+    in property <bool> close-button;
+    callback activated();
+    width: 46px; height: 44px;
+    background: touch.has-hover || touch.pressed ? (root.close-button ? #c42b3a : (Theme.dark ? #ffffff18 : #18233812)) : transparent;
+    Path { x: (parent.width - 12px) / 2; y: (parent.height - 12px) / 2; width: 12px; height: 12px;
+        commands: root.icon-path; stroke: root.close-button && touch.has-hover ? white : Theme.ink; stroke-width: 1px;
+    }
+    focus := FocusScope {
+        accessible-role: button; accessible-label: root.label;
+        key-pressed(event) => { if event.text == "\n" || event.text == " " { root.activated(); return accept; } return reject; }
+        // Handle the press before the focus scope can consume it for focus alone.
+        touch := TouchArea { clicked => { focus.focus(); root.activated(); } }
+    }
+}

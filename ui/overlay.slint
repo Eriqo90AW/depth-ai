@@ -1,0 +1,93 @@
+import { Palette } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export component OverlayWindow inherits Window {
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    title: "Depth overlay";
+    width: 156px; height: 48px;
+    no-frame: true; always-on-top: true;
+    icon: @image-url("../assets/icon/png/depth-256.png");
+    background: transparent;
+    default-font-family: "Segoe UI Variable";
+    in property <string> state;
+    in property <string> elapsed;
+    in property <bool> finishing;
+    callback stop();
+    callback open-app();
+    private property <float> wave-phase: Theme.reduced-motion ? 0 : mod(animation-tick(), 2400ms) / 2400ms;
+
+    Rectangle {
+        border-radius: 18px;
+        background: Theme.reduced-transparency ? Theme.glass : Theme.glass.with-alpha(0.75);
+        border-color: Theme.edge;
+        border-width: 1px;
+
+        stop-focus := FocusScope {
+            x: 0px; y: 0px; width: 48px; height: parent.height;
+            enabled: !root.finishing;
+            accessible-role: button;
+            accessible-label: "Stop recording";
+            key-pressed(event) => {
+                if !root.finishing && (event.text == "\n" || event.text == " ") {
+                    root.stop(); return accept;
+                }
+                return reject;
+            }
+            Rectangle {
+                x: 8px; y: 8px; width: 32px; height: 32px;
+                border-radius: 10px;
+                background: root.finishing ? transparent :
+                    (stop-touch.has-hover || stop-touch.pressed ? #ef667238 : #ef66721a);
+                border-width: stop-focus.has-focus ? 1px : 0px;
+                border-color: Theme.accent;
+                Rectangle {
+                    x: 11px; y: 11px; width: 10px; height: 10px;
+                    border-radius: 2px;
+                    background: root.finishing ? Theme.muted : #ef6672;
+                }
+            }
+            // Keep this hit area separate so stopping never also opens the app.
+            stop-touch := TouchArea {
+                mouse-cursor: root.finishing ? default : pointer;
+                clicked => {
+                    if !root.finishing { stop-focus.focus(); root.stop(); }
+                }
+            }
+        }
+
+        open-focus := FocusScope {
+            x: 48px; y: 0px; width: parent.width - 48px; height: parent.height;
+            accessible-role: button;
+            accessible-label: "Open Depth";
+            accessible-description: root.state + " " + root.elapsed;
+            key-pressed(event) => {
+                if event.text == "\n" || event.text == " " {
+                    root.open-app(); return accept;
+                }
+                return reject;
+            }
+            Rectangle {
+                x: 0px; y: 6px; width: parent.width - 6px; height: parent.height - 12px;
+                border-radius: 12px;
+                background: open-touch.has-hover || open-touch.pressed ?
+                    (Theme.dark ? #ffffff0c : #18233808) : transparent;
+                border-width: open-focus.has-focus ? 1px : 0px;
+                border-color: Theme.accent;
+                for bar in 13: Rectangle {
+                    x: 8px + bar * 7px;
+                    width: 3px;
+                    height: 4px + (root.finishing ? 10px : 22px) *
+                        (0.5 + 0.5 * sin(root.wave-phase * 360deg *
+                            (root.finishing ? 1 : 2) + bar * 38deg));
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 2px;
+                    background: Theme.accent;
+                }
+            }
+            open-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { open-focus.focus(); root.open-app(); }
+            }
+        }
+    }
+}

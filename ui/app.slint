@@ -1,0 +1,209 @@
+import { Palette, Button, VerticalBox, HorizontalBox, ScrollView, LineEdit, CheckBox, ComboBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { CaptionButton } from "chrome.slint";
+export { Theme } from "theme.slint";
+export { SettingsWindow } from "settings.slint";
+export { OverlayWindow } from "overlay.slint";
+export { NotificationWindow } from "notification.slint";
+export struct LibraryRow { id: string, title: string, detail: string, preview: string, state: string }
+export component MainWindow inherits Window {
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    no-frame: true; resize-border-width: root.maximized ? 0px : 6px;
+    title: "Depth"; preferred-width: 1180px; preferred-height: 780px; min-width: 800px; min-height: 600px;
+    icon: @image-url("../assets/icon/png/depth-256.png");
+    background: Theme.backdrop-supported && !Theme.reduced-transparency ? transparent : Theme.base; default-font-family: "Segoe UI Variable"; default-font-size: 14px;
+    in property <bool> compact;
+    in-out property <int> language;
+    callback language-selected(int);
+    in property <[LibraryRow]> recordings;
+    in-out property <string> selected-id;
+    in-out property <string> recording-title;
+    in property <string> detail;
+    in-out property <string> document;
+    in property <string> state: "Ready to record";
+    in property <bool> recording;
+    in property <bool> finishing;
+    in property <bool> can-continue;
+    in property <bool> can-delete;
+    in property <bool> legacy-recording;
+    in-out property <bool> delete-prompt;
+    in property <string> elapsed: "00:00:00";
+    in property <string> warning;
+    in property <string> live-draft;
+    in property <string> capture-guidance;
+    in property <string> capture-source;
+    in-out property <bool> timed;
+    in-out property <string> query;
+    in property <string> matches;
+    in-out property <string> export-path;
+    in-out property <bool> exporting;
+    in-out property <bool> sidebar-open;
+    in-out property <bool> quit-prompt;
+    in-out property <bool> unread;
+    property <int> last-cursor-offset: 0;
+    in property <string> hotkey;
+    callback select-recording(string);
+    callback continue-recording();
+    callback delete-recording();
+    callback toggle-recording(); callback settings(); callback quit(); callback confirm-quit(); callback review-unsaved();
+    callback copy-document(bool); callback export-document(bool); callback rename-recording(string);
+    callback view-timed(bool); callback find(int);
+    out property <int> selection-anchor: input.anchor-position-byte-offset;
+    out property <int> selection-cursor: input.cursor-position-byte-offset;
+    in-out property <length> document-scroll <=> scroll.content-y;
+    out property <bool> at-bottom: scroll.content-y >= 0px || -scroll.content-y >= scroll.content-height - scroll.visible-height - 32px;
+    public function replace-document(value: string, reset: bool) {
+        let anchor = input.anchor-position-byte-offset;
+        let cursor = input.cursor-position-byte-offset;
+        let y = scroll.content-y;
+        let follow = root.at-bottom && anchor == cursor;
+        root.last-cursor-offset = reset ? 0 : cursor;
+        root.document = value;
+        if reset { input.set-selection-offsets(0, 0); scroll.content-y = 0px; root.unread = false; }
+        else { input.set-selection-offsets(anchor, cursor); if follow { root.jump-latest(); } else { scroll.content-y = y; root.unread = true; } }
+    }
+    public function jump-latest() { scroll.content-y = min(0px, scroll.visible-height - scroll.content-height); root.unread = false; }
+    public function highlight-match(start: int, end: int) { root.last-cursor-offset = -1; input.set-selection-offsets(start, end); }
+    public function select-match(start: int, end: int) { input.focus(); root.highlight-match(start, end); }
+    VerticalBox { padding: 0px; spacing: 0px;
+        Rectangle { height: 44px; background: Theme.glass;
+            HorizontalBox { padding: 0px; spacing: 0px;
+                WindowMoveArea {
+                    Text { x: 20px; text: "Depth"; color: Theme.ink; font-weight: 600; vertical-alignment: center; }
+                    TouchArea { double-clicked => { root.maximized = !root.maximized; } }
+                }
+                CaptionButton { label: "Minimize"; icon-path: "M 1 6 L 11 6"; activated => { root.minimized = true; } }
+                CaptionButton { label: root.maximized ? "Restore" : "Maximize"; icon-path: root.maximized ? "M 3 1 L 11 1 L 11 9 M 1 3 L 9 3 L 9 11 L 1 11 Z" : "M 1 1 L 11 1 L 11 11 L 1 11 Z"; activated => { root.maximized = !root.maximized; } }
+                CaptionButton { label: "Close"; close-button: true; icon-path: "M 1 1 L 11 11 M 11 1 L 1 11"; activated => { root.close(); } }
+            }
+        }
+        HorizontalBox { min-width: 0px; preferred-width: 0px; padding: 16px; spacing: 16px;
+            if !root.compact || root.sidebar-open: Rectangle {
+                width: !root.compact ? 274px : 210px; background: Theme.glass; animate background { duration: Theme.reduced-motion ? 0ms : 120ms; } border-radius: 20px; border-color: Theme.edge; border-width: 1px;
+                VerticalBox { padding: 16px; spacing: 16px;
+                    HorizontalBox { spacing: 10px;
+                        Rectangle { width: 32px; height: 32px; border-radius: 10px; background: #3467c9;
+                            Path { x: 8px; y: 8px; width: 16px; height: 16px; stroke: white; stroke-width: 2px; commands: "M 2 6 L 2 10 M 6 2 L 6 14 M 10 0 L 10 16 M 14 4 L 14 12"; }
+                        }
+                        Text { text: "Depth"; font-size: 23px; font-weight: 600; color: Theme.ink; }
+                    }
+                    Text { text: "RECORDINGS"; font-size: 11px; color: Theme.muted; letter-spacing: 1px; }
+                    ScrollView { VerticalBox { padding: 0px; spacing: 8px;
+                        for row in root.recordings: Rectangle {
+                            min-height: 112px; border-radius: 12px; background: row.id == root.selected-id ? (Theme.dark ? #30415c : #e0eaff) : transparent;
+                            VerticalBox { padding: 12px; spacing: 5px;
+                                Text { text: row.title; color: Theme.ink; font-weight: 600; overflow: elide; }
+                                Text { text: row.detail; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                Text { text: row.preview; color: Theme.muted; font-size: 12px; overflow: elide; }
+                                Text { text: row.state; color: row.state == "Incomplete" ? #dc5a67 : Theme.accent; font-size: 11px; }
+                            }
+                            TouchArea { clicked => { root.select-recording(row.id); } }
+                            FocusScope { accessible-role: button; accessible-label: row.title; key-pressed(event) => { if event.text == "\n" || event.text == " " { root.select-recording(row.id); return accept; } return reject; } }
+                        }
+                        if root.recordings.length == 0: Text { text: "Your recordings will appear here."; wrap: word-wrap; color: Theme.muted; }
+                        Rectangle { vertical-stretch: 1; }
+                    } }
+                    Button { text: "Settings"; clicked => { root.settings(); } }
+                    Button { text: "Quit Depth"; clicked => { root.quit(); } }
+                }
+            }
+            VerticalBox { min-width: 0px; preferred-width: 0px; spacing: root.compact ? 10px : 14px;
+                HorizontalBox { min-width: 0px; preferred-width: 0px; padding: 0px; spacing: 8px;
+                    if root.compact: Button { text: root.sidebar-open ? "Hide library" : "Library"; clicked => { root.sidebar-open = !root.sidebar-open; } }
+                    if !root.compact || !root.sidebar-open: Text { text: root.recording || root.finishing ? "Language for next recording" : "Language"; color: Theme.muted; vertical-alignment: center; }
+                    ComboBox { min-width: 120px; preferred-width: 160px; horizontal-stretch: 1; model: ["English", "Indonesian"]; current-index <=> root.language; accessible-label: "Recording language"; selected => { root.language-selected(root.language); } }
+                    Rectangle {}
+                    if root.compact: Button { text: "Settings"; clicked => { root.settings(); } }
+                    if root.compact: Button { text: "Quit"; clicked => { root.quit(); } }
+                }
+                Rectangle { background: Theme.panel; border-radius: 20px; border-width: 1px; border-color: Theme.edge;
+                    VerticalBox { padding: root.compact ? 18px : 32px; spacing: root.compact ? 10px : 16px;
+                        if root.selected-id != "": VerticalBox { spacing: 8px;
+                            HorizontalBox { padding: 0px; spacing: 8px;
+                                title-edit := LineEdit { text <=> root.recording-title; accepted => { root.rename-recording(root.recording-title); } }
+                                Button { text: "Delete"; accessible-label: "Delete recording"; enabled: root.can-delete; clicked => { root.delete-prompt = true; } }
+                            }
+                            Text { text: root.detail; color: Theme.muted; font-size: 12px; }
+                            if !root.delete-prompt: HorizontalBox { spacing: 8px;
+                                Button { text: "Copy text"; clicked => { root.copy-document(false); } }
+                                Button { text: "Copy timestamps"; clicked => { root.copy-document(true); } }
+                                Button { text: "Export"; clicked => { root.exporting = !root.exporting; } }
+                                CheckBox { text: "Timed view"; checked <=> root.timed; toggled => { root.view-timed(root.timed); } }
+                            }
+                            if !root.delete-prompt: HorizontalBox { LineEdit { placeholder-text: "Find in recording"; text <=> root.query; edited => { root.find(0); } accepted => { root.find(1); } } Text { text: root.matches; color: Theme.muted; } Button { text: "Previous"; clicked => { root.find(-1); } } Button { text: "Next"; clicked => { root.find(1); } } }
+                        }
+                        if root.delete-prompt: Rectangle {
+                            min-height: root.compact ? 132px : 124px; vertical-stretch: 0;
+                            border-radius: 10px; background: Theme.dark ? #482d34 : #ffedf0;
+                            VerticalBox { padding: 12px; spacing: 8px;
+                                Text { text: "Delete this recording?"; color: Theme.ink; font-weight: 600; }
+                                Text { text: root.legacy-recording ? "Remove this imported recording from the library. Its shared source file stays on disk." : "This permanently removes the recording and its saved transcript."; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
+                                HorizontalBox { padding: 0px; spacing: 8px;
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Button { text: "Cancel"; clicked => { root.delete-prompt = false; } }
+                                    Button { text: "Delete recording"; accessible-label: "Confirm delete recording"; enabled: root.can-delete; clicked => { root.delete-prompt = false; root.delete-recording(); } }
+                                }
+                            }
+                        }
+                        if root.exporting && !root.delete-prompt: VerticalBox {
+                            LineEdit { text <=> root.export-path; placeholder-text: "Export file path"; }
+                            HorizontalBox { Button { text: "Save Markdown"; clicked => { root.export-document(true); } } Button { text: "Save plain text"; clicked => { root.export-document(false); } } }
+                        }
+                        if root.warning != "": Rectangle { background: Theme.dark ? #482d34 : #ffedf0; border-radius: 10px; min-height: 58px;
+                            Text { x: 12px; y: 10px; width: parent.width - 24px; text: root.warning; wrap: word-wrap; color: Theme.dark ? #ffd3d9 : #8b2837; }
+                        }
+                        if root.capture-guidance != "": Text { text: root.capture-guidance; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
+                        scroll := ScrollView {
+                            vertical-stretch: 1;
+                            content-width: self.visible-width;
+                            content-height: max(self.visible-height, input.preferred-height + 20px);
+                            input := TextInput {
+                                text <=> root.document; read-only: true; single-line: false; wrap: word-wrap;
+                                width: scroll.visible-width; height: self.preferred-height; font-size: 17px; color: Theme.ink;
+                                selection-background-color: #3467c9; selection-foreground-color: white;
+                                page-height: scroll.visible-height;
+                                cursor-position-changed(p) => { if input.cursor-position-byte-offset != root.last-cursor-offset { root.last-cursor-offset = input.cursor-position-byte-offset; if p.y + scroll.content-y < 0px {scroll.content-y = -p.y;} else if p.y + scroll.content-y > scroll.visible-height - 24px {scroll.content-y = scroll.visible-height - p.y - 24px;} } }
+                            }
+                        }
+                        if root.unread: Button { text: "Jump to latest"; clicked => { root.jump-latest(); } }
+                        if root.live-draft != "": VerticalBox { spacing: 6px; vertical-stretch: 0;
+                            Text { text: "Live draft"; color: Theme.muted; font-size: 12px; }
+                            ScrollView { height: root.compact ? 60px : 112px; vertical-stretch: 0; content-width: self.visible-width;
+                                Text { x: 0px; y: 0px; text: root.live-draft; width: parent.visible-width; height: self.preferred-height; vertical-alignment: top; wrap: word-wrap; color: Theme.muted; font-size: 17px; }
+                            }
+                        }
+                    }
+                    if root.selected-id == "": VerticalBox { x: 40px; y: (parent.height - self.height) / 2; width: parent.width - 80px; height: 110px; alignment: center; spacing: 12px;
+                            Text { text: "Make room for listening."; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
+                            Text { text: "Record desktop audio. Depth turns speech into a readable document, saved on this computer."; wrap: word-wrap; color: Theme.muted; horizontal-alignment: center; }
+                        }
+                }
+                Rectangle { height: root.can-continue && !root.recording && !root.finishing ? 108px : 78px; border-radius: 18px; background: Theme.glass; border-width: 1px; border-color: Theme.edge;
+                    VerticalBox { padding: 14px; spacing: 8px;
+                        HorizontalBox { min-width: 0px; preferred-width: 0px; padding: 0px; spacing: 12px;
+                            Rectangle { width: 10px;
+                                Rectangle { y: (parent.height - self.height) / 2; width: 10px; height: 10px; border-radius: 5px; background: root.recording ? #ee6473 : Theme.accent; }
+                            }
+                            VerticalBox { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; padding: 0px; spacing: 3px; alignment: center;
+                                Text { text: root.state; color: Theme.ink; font-weight: 600; overflow: elide; }
+                                Text { text: root.capture-source != "" ? root.capture-source : root.hotkey; color: Theme.muted; font-size: 11px; overflow: elide; }
+                            }
+                            Text { text: root.elapsed; color: Theme.muted; font-size: 18px; vertical-alignment: center; }
+                            if !root.can-continue || root.recording || root.finishing: Button { text: root.finishing ? "Finishing…" : root.recording ? "Stop recording" : "Start recording"; primary: true; enabled: !root.finishing; clicked => { root.toggle-recording(); } }
+                        }
+                        if root.can-continue && !root.recording && !root.finishing: HorizontalBox { padding: 0px; spacing: 8px;
+                            Rectangle { horizontal-stretch: 1; }
+                            Button { text: "New recording"; clicked => { root.toggle-recording(); } }
+                            Button { text: "Continue recording"; primary: true; clicked => { root.continue-recording(); } }
+                        }
+                    }
+                }
+                if root.quit-prompt: Rectangle { height: 108px; border-radius: 12px; background: Theme.panel;
+                    VerticalBox { padding: 12px; Text { text: "Unsaved recordings remain in memory. Export them before quitting."; color: Theme.ink; wrap: word-wrap; }
+                        HorizontalBox { Button { text: "Export unsaved"; primary: true; clicked => { root.review-unsaved(); } } Button { text: "Keep Depth open"; clicked => { root.quit-prompt = false; } } Button { text: "Quit without exporting"; clicked => { root.confirm-quit(); } } }
+                    }
+                }
+            }
+        }
+    }
+}

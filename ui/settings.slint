@@ -1,0 +1,64 @@
+import { Palette, Button, VerticalBox, HorizontalBox, ScrollView, LineEdit, CheckBox, ComboBox, TextEdit } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+export component SettingsWindow inherits Window {
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    title: "Depth settings"; preferred-width: 690px; preferred-height: 760px; min-width: 560px; min-height: 500px;
+    icon: @image-url("../assets/icon/png/depth-256.png");
+    background: Theme.backdrop-supported && !Theme.reduced-transparency ? transparent : Theme.base; default-font-family: "Segoe UI Variable";
+    in-out property <int> language;
+    in property <[string]> output-devices;
+    in property <[string]> output-device-ids;
+    in-out property <int> output-device;
+    in-out property <int> theme;
+    in-out property <bool> autosave;
+    in-out property <bool> startup;
+    in-out property <bool> overlay;
+    in-out property <bool> notifications;
+    in-out property <bool> reduced-transparency;
+    in-out property <bool> reduced-motion;
+    in-out property <int> corner;
+    in-out property <string> hotkey;
+    in-out property <string> active-hotkey;
+    in-out property <string> advanced;
+    in-out property <string> error;
+    in-out property <bool> show-advanced;
+    callback save-settings();
+    callback appearance(int, bool, bool);
+    VerticalBox {
+        padding: 24px; spacing: 16px;
+        Text { text: "Settings"; font-size: 26px; font-weight: 600; color: Theme.ink; }
+        Text { text: "Capture, engine and autosave changes apply to the next recording."; wrap: word-wrap; color: Theme.muted; }
+        ScrollView {
+            VerticalBox { padding: 6px; spacing: 18px;
+                Text { text: "Appearance"; font-size: 18px; font-weight: 600; color: Theme.ink; }
+                ComboBox { model: ["System", "Light", "Dark"]; current-index <=> root.theme; selected => { root.appearance(root.theme, root.reduced-transparency, root.reduced-motion); } }
+                CheckBox { text: "Reduce transparency"; checked <=> root.reduced-transparency; toggled => { root.appearance(root.theme, root.reduced-transparency, root.reduced-motion); } }
+                CheckBox { text: "Reduce motion"; checked <=> root.reduced-motion; toggled => { root.appearance(root.theme, root.reduced-transparency, root.reduced-motion); } }
+                Text { text: "Recording"; font-size: 18px; font-weight: 600; color: Theme.ink; }
+                ComboBox { model: ["English", "Indonesian"]; current-index <=> root.language; }
+                Text { text: "Desktop audio source"; color: Theme.ink; }
+                ComboBox { model: root.output-devices; current-index <=> root.output-device; accessible-label: "Desktop audio source"; }
+                Text { text: "Windows default captures desktop playback even with speakers muted on supported Windows versions. Selecting a device captures only that output."; wrap: word-wrap; color: Theme.muted; }
+                CheckBox { text: "Automatically save recordings"; checked <=> root.autosave; }
+                CheckBox { text: "Start recording when Depth launches"; checked <=> root.startup; }
+                Text { text: "Global hotkey"; color: Theme.ink; }
+                LineEdit { text <=> root.hotkey; placeholder-text: "Ctrl+Alt+Space"; }
+                Text { text: "Registered: " + root.active-hotkey; color: Theme.muted; }
+                Text { text: "Overlay and notifications"; font-size: 18px; font-weight: 600; color: Theme.ink; }
+                CheckBox { text: "Show floating recording controls"; checked <=> root.overlay; }
+                ComboBox { model: ["Bottom right", "Bottom left", "Top right", "Top left"]; current-index <=> root.corner; }
+                CheckBox { text: "Notify when transcription finishes"; checked <=> root.notifications; }
+                Button { text: root.show-advanced ? "Hide advanced" : "Advanced"; clicked => { root.show-advanced = !root.show-advanced; } }
+                if root.show-advanced: VerticalBox {
+                    Text { text: "Engine and capture tuning. Edit the values below. All settings are validated before saving."; wrap: word-wrap; color: Theme.muted; }
+                    TextEdit { text <=> root.advanced; min-height: 400px; font-family: "Consolas"; font-size: 13px; wrap: no-wrap; }
+                }
+            }
+        }
+        if root.error != "": Text { text: root.error; color: #df505b; wrap: word-wrap; }
+        HorizontalBox { Rectangle {} Button { text: "Save settings"; primary: true; clicked => { root.save-settings(); } } }
+    }
+}
+
+
+

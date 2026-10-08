@@ -1,0 +1,69 @@
+# Rust build output and workspace-local tools.
+# Keep Cargo.lock and .cargo/config.toml tracked for reproducible builds.
+target/
+/.toolchain/
+/rustup-init.exe
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# Generated installers. Keep the installer scripts and build/winres.rs tracked.
+/dist/
+/installer/Output/
+
+# Downloaded model weights and engine runtimes from scripts/fetch_assets.py.
+/models/**/*.cact
+/models/**/*.bin
+/models/**/*.gguf
+/models/**/*.onnx
+/vendor/needle/
+/vendor/whisper/
+
+# Local app homes, transcripts, and capture/transcription scratch audio.
+/.scratch/
+/config.toml
+/transcripts/
+/.events/
+/testdata/**/*.wav
+/*.wav
+
+# Logs, temporary files, and incomplete downloads.
+*.log
+*.tmp
+*.temp
+*.part
+*.bak
+*~
+*.swp
+*.swo
+
+# Local environment files and private signing credentials.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Python helper caches and virtual environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor-specific local state. Shared VS Code settings may still be committed.
+.vs/
+.idea/
+.vscode/*.local.json
+*.suo
+*.user
+*.code-workspace
+
+# OS metadata.
+.DS_Store
+Thumbs.db
+Desktop.ini
