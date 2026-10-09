@@ -13,8 +13,11 @@
 
 pub mod capture;
 pub mod config;
+pub mod editing;
 pub mod engine;
+pub mod gpu;
 pub mod hotkey;
+pub mod models;
 
 pub mod live;
 pub mod logging;
@@ -31,5 +34,6 @@ pub mod clipboard;
 #[cfg(feature = "tray")]
 pub mod gui;
 pub mod recording;
+pub mod speakers;
 #[cfg(feature = "tray")]
 pub mod tray;

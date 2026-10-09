@@ -64,6 +64,12 @@ Name: "startupicon"; Description: "Start automatically when I sign in (stays idl
 ; The engines are looked up relative to the executable, so these folders must keep their
 ; names: vendor\needle\windows-x86_64 for the Cactus runner, vendor\whisper for whisper.cpp.
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\sherpa-onnx-c-api.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\models\speaker-segmentation.int8.onnx"; DestDir: "{app}\models"; Flags: ignoreversion
+Source: "..\models\nemo_en_titanet_small.onnx"; DestDir: "{app}\models"; Flags: ignoreversion
+Source: "..\vendor\speakers\licenses\*"; DestDir: "{app}\vendor\speakers\licenses"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "..\models\whistle.cact"; DestDir: "{app}\models"; Flags: ignoreversion
 Source: "..\vendor\needle\windows-x86_64\needle.exe"; DestDir: "{app}\vendor\needle\windows-x86_64"; \
@@ -71,14 +77,16 @@ Source: "..\vendor\needle\windows-x86_64\needle.exe"; DestDir: "{app}\vendor\nee
 
 ; Indonesian: final and draft checkpoints plus the ggml runtime DLLs beside the CLI.
 ; The checkpoint is already quantised, so compressing it only wastes build time.
-Source: "..\models\ggml-small-q5_1.bin"; DestDir: "{app}\models"; \
+Source: "..\models\ggml-small-id-q8_0.bin"; DestDir: "{app}\models"; \
     Flags: ignoreversion nocompression
 Source: "..\models\ggml-base-q5_1.bin"; DestDir: "{app}\models"; \
     Flags: ignoreversion nocompression
-Source: "..\vendor\whisper\Release\whisper-cli.exe"; DestDir: "{app}\vendor\whisper"; \
-    Flags: ignoreversion
-Source: "..\vendor\whisper\Release\*.dll"; DestDir: "{app}\vendor\whisper"; \
-    Flags: ignoreversion
+Source: "..\vendor\whisper\cpu\whisper-cli.exe"; DestDir: "{app}\vendor\whisper\cpu"; Flags: ignoreversion
+Source: "..\vendor\whisper\cpu\*.dll"; DestDir: "{app}\vendor\whisper\cpu"; Flags: ignoreversion
+Source: "..\vendor\whisper\cuda\whisper-cli.exe"; DestDir: "{app}\vendor\whisper\cuda"; Flags: ignoreversion
+Source: "..\vendor\whisper\cuda\*.dll"; DestDir: "{app}\vendor\whisper\cuda"; Flags: ignoreversion
+Source: "..\vendor\whisper\licenses\*"; DestDir: "{app}\vendor\whisper\licenses"; Flags: ignoreversion
+Source: "..\models\licenses\*"; DestDir: "{app}\models\licenses"; Flags: ignoreversion
 
 [Icons]
 ; IconFilename is spelled out so every shortcut carries the app's mark rather than the icon of

@@ -83,18 +83,41 @@ impl AsrEngine for WhisperEngine {
 
         let count = state.full_n_segments();
         let mut text = String::new();
+        let mut words = Vec::new();
         for index in 0..count {
             // whisper-rs 0.16 exposes segments as objects rather than by-text accessor.
             if let Some(segment) = state.get_segment(index)
                 && let Ok(chunk) = segment.to_str_lossy()
             {
                 text.push_str(&chunk);
+                if self.word_timestamps {
+                    for token_index in 0..segment.n_tokens() {
+                        if let Some(token) = segment.get_token(token_index) {
+                            let data = token.token_data();
+                            if let Ok(word) = token.to_str_lossy() {
+                                if data.t0 >= 0
+                                    && data.t1 > data.t0
+                                    && !word.starts_with("[_")
+                                    && !word.starts_with("<|")
+                                {
+                                    words.push(super::Word {
+                                        word: word.into_owned(),
+                                        start: data.t0 as f32 / 100.0,
+                                        end: data.t1 as f32 / 100.0,
+                                        probability: data.p,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
         Ok(AsrResult {
             text: text.trim().to_string(),
             language: Some(self.language.clone()),
+            words,
             ..Default::default()
         })
     }

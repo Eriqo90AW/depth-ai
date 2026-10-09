@@ -1,0 +1,39 @@
+import { Palette, Button, VerticalBox, HorizontalBox, ListView, TextEdit } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+export struct EditorRow { label: string, text: string }
+export component TranscriptEditorWindow inherits Window {
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    title: "Edit transcript"; preferred-width: 760px; preferred-height: 720px; min-width: 500px; min-height: 480px;
+    icon: @image-url("../assets/icon/png/depth-256.png");
+    background: Theme.base; default-font-family: "Segoe UI Variable"; default-font-size: 14px;
+    in property <string> recording-title;
+    in-out property <[EditorRow]> passages;
+    in-out property <bool> dirty;
+    in-out property <bool> discard-prompt;
+    in-out property <string> error;
+    callback save(); callback cancel(); callback discard();
+    VerticalBox { padding: 24px; spacing: 12px;
+        Text { text: "Edit transcript"; font-size: 26px; color: Theme.ink; font-weight: 600; }
+        Text { text: root.recording-title; color: Theme.ink; overflow: elide; }
+        Text { text: "Correct the text below. Passage timestamps and speaker labels stay attached. Save updates copy, search, and export."; color: Theme.muted; wrap: word-wrap; }
+        ListView { vertical-stretch: 1;
+            for passage in root.passages: VerticalBox { padding: 4px; spacing: 6px;
+                Text { text: passage.label; color: Theme.muted; font-size: 12px; }
+                TextEdit { height: 120px; text <=> passage.text; wrap: word-wrap; accessible-label: "Transcript passage " + passage.label; edited => { root.dirty = true; } }
+            }
+        }
+        if root.error != "": Text { text: root.error; wrap: word-wrap; color: #df505b; }
+        if root.discard-prompt: VerticalBox { spacing: 8px;
+            Text { text: "Discard your unsaved changes?"; color: Theme.ink; wrap: word-wrap; }
+            HorizontalBox {
+                Button { text: "Keep editing"; primary: true; clicked => { root.discard-prompt = false; } }
+                Button { text: "Discard changes"; clicked => { root.discard(); } }
+            }
+        }
+        HorizontalBox {
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Cancel"; clicked => { root.cancel(); } }
+            Button { text: "Save changes"; primary: true; enabled: root.dirty; clicked => { root.save(); } }
+        }
+    }
+}

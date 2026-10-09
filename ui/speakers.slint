@@ -1,0 +1,48 @@
+import { Palette, Button, VerticalBox, HorizontalBox, ScrollView, LineEdit, ComboBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+export struct SpeakerRow { id: string, name: string, sample: string }
+export component SpeakersWindow inherits Window {
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    title: "Speakers"; preferred-width: 620px; preferred-height: 680px; min-width: 500px; min-height: 480px;
+    icon: @image-url("../assets/icon/png/depth-256.png");
+    background: Theme.base; default-font-family: "Segoe UI Variable"; default-font-size: 14px;
+    in property <[SpeakerRow]> speakers;
+    in property <[string]> names;
+    in property <[string]> turn-choices;
+    in property <[string]> assignment-choices;
+    in property <bool> editing-enabled;
+    in property <string> status;
+    in-out property <string> error;
+    in-out property <int> turn-index: 0;
+    in-out property <int> assignment-index: 0;
+    callback rename-speaker(string, string);
+    callback merge-speaker(string, int);
+    callback reassign-turn(int, int);
+    VerticalBox { padding: 24px; spacing: 14px;
+        Text { text: "Speakers"; font-size: 26px; color: Theme.ink; font-weight: 600; }
+        Text { text: root.status; wrap: word-wrap; color: Theme.muted; }
+        ScrollView { vertical-stretch: 1; content-width: self.visible-width;
+            VerticalBox { padding: 4px; spacing: 20px;
+                for speaker in root.speakers: VerticalBox { spacing: 8px;
+                    HorizontalBox { spacing: 8px;
+                        name-field := LineEdit { text: speaker.name; enabled: root.editing-enabled; accessible-label: "Speaker name"; accepted => { root.rename-speaker(speaker.id, self.text); } }
+                        Button { text: "Rename"; enabled: root.editing-enabled; clicked => { root.rename-speaker(speaker.id, name-field.text); } }
+                    }
+                    Text { text: speaker.sample; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
+                    HorizontalBox { spacing: 8px;
+                        merge-choice := ComboBox { model: root.names; current-index: -1; enabled: root.editing-enabled; accessible-label: "Merge into speaker"; }
+                        Button { text: "Merge into"; enabled: root.editing-enabled && merge-choice.current-index >= 0; clicked => { root.merge-speaker(speaker.id, merge-choice.current-index); } }
+                    }
+                }
+                if root.speakers.length == 0: Text { text: "No speakers identified yet."; color: Theme.muted; }
+            }
+        }
+        Text { text: "Correct a turn"; font-weight: 600; color: Theme.ink; }
+        ComboBox { model: root.turn-choices; current-index <=> root.turn-index; enabled: root.editing-enabled; accessible-label: "Transcript turn"; }
+        HorizontalBox { spacing: 8px;
+            ComboBox { model: root.assignment-choices; current-index <=> root.assignment-index; enabled: root.editing-enabled; accessible-label: "Assign turn to speaker"; }
+            Button { text: "Assign speaker"; enabled: root.editing-enabled && root.turn-choices.length > 0; clicked => { root.reassign-turn(root.turn-index, root.assignment-index); } }
+        }
+        if root.error != "": Text { text: root.error; wrap: word-wrap; color: #df505b; }
+    }
+}

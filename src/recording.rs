@@ -37,6 +37,22 @@ pub struct Recording {
     pub autosave: bool,
     pub preview: String,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub detect_speakers: bool,
+    #[serde(default)]
+    pub speakers: Vec<crate::speakers::Speaker>,
+    #[serde(default)]
+    pub word_timings: std::collections::BTreeMap<u64, Vec<crate::speakers::WordTiming>>,
+    #[serde(default)]
+    pub speaker_turns: Vec<crate::speakers::SpeakerTurn>,
+    #[serde(default)]
+    pub speaker_overrides: Vec<crate::speakers::Assignment>,
+    #[serde(default)]
+    pub speaker_analyzed_ms: u64,
+    #[serde(default)]
+    pub speaker_finished: bool,
+    #[serde(default)]
+    pub speaker_notice: String,
     #[serde(default, skip_serializing)]
     pub segments: Vec<TranscriptSegment>,
     #[serde(skip)]
@@ -65,6 +81,14 @@ impl Recording {
             autosave,
             preview: String::new(),
             warnings: vec![],
+            detect_speakers: false,
+            speakers: vec![],
+            word_timings: Default::default(),
+            speaker_turns: vec![],
+            speaker_overrides: vec![],
+            speaker_analyzed_ms: 0,
+            speaker_finished: false,
+            speaker_notice: String::new(),
             segments: vec![],
             source: None,
             legacy_session: None,
@@ -95,6 +119,14 @@ impl Recording {
             autosave: self.autosave,
             preview: self.preview.clone(),
             warnings: self.warnings.clone(),
+            detect_speakers: self.detect_speakers,
+            speakers: self.speakers.clone(),
+            word_timings: Default::default(),
+            speaker_turns: vec![],
+            speaker_overrides: vec![],
+            speaker_analyzed_ms: self.speaker_analyzed_ms,
+            speaker_finished: self.speaker_finished,
+            speaker_notice: self.speaker_notice.clone(),
             segments: vec![],
             source: self.source.clone(),
             legacy_session: self.legacy_session,
@@ -102,6 +134,9 @@ impl Recording {
         }
     }
     pub fn text(&self, timed: bool) -> String {
+        if self.detect_speakers {
+            return crate::speakers::render(self, timed);
+        }
         if timed {
             return self
                 .segments
@@ -196,8 +231,94 @@ pub enum PipelineEvent {
     Deleted {
         id: String,
     },
+    TranscriptUpdated {
+        id: String,
+    },
+    TranscriptEdited {
+        id: String,
+        correction: crate::editing::Correction,
+    },
+    Speaker {
+        id: String,
+        change: crate::speakers::Change,
+    },
 }
 
+/// Persist a completed-recording correction before publishing it to readers.
+pub(crate) fn save_correction(
+    r: &mut Recording,
+    mut next: Recording,
+    event: PipelineEvent,
+    dir: &Path,
+) -> std::io::Result<()> {
+    if r.autosave {
+        if let Some(path) = &r.source {
+            if r.legacy_session.is_some()
+                || path != &dir.join(".events").join(format!("{}.jsonl", r.id))
+            {
+                return Err(std::io::Error::other("Invalid recording journal"));
+            }
+            let bytes = std::fs::read(path)?;
+            let mut valid_end = 0;
+            for line in bytes.split_inclusive(|b| *b == b'\n') {
+                if serde_json::from_slice::<PipelineEvent>(line).is_err() {
+                    break;
+                }
+                valid_end += line.len();
+            }
+            if valid_end == 0 {
+                return Err(std::io::Error::other("Recording header is damaged"));
+            }
+            if valid_end < bytes.len() {
+                // Preserve the complete original before replacing its damaged tail.
+                // Backups use a separate extension so library scans do not import them.
+                let mut backup = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.with_extension("recovery-backup"))?;
+                backup.write_all(b"\n--- Original journal before correction ---\n")?;
+                backup.write_all(&bytes)?;
+                backup.sync_all()?;
+                let mut repaired = bytes[..valid_end].to_vec();
+                if !repaired.ends_with(b"\n") {
+                    repaired.push(b'\n');
+                }
+                let message = "Recovered a damaged journal tail. Original bytes are preserved locally until this recording is deleted.".to_string();
+                next.warnings.push(message.clone());
+                for recovered in [
+                    PipelineEvent::Warning {
+                        id: r.id.clone(),
+                        message,
+                    },
+                    PipelineEvent::State {
+                        id: r.id.clone(),
+                        status: r.status.clone(),
+                        duration_ms: r.duration_ms,
+                    },
+                    event,
+                ] {
+                    serde_json::to_writer(&mut repaired, &recovered)?;
+                    repaired.push(b'\n');
+                }
+                atomic_write(path, &repaired)?;
+            } else {
+                let mut file = OpenOptions::new().append(true).open(path)?;
+                if !bytes.ends_with(b"\n") {
+                    file.write_all(b"\n")?;
+                }
+                serde_json::to_writer(&mut file, &event)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+            }
+            // The journal is authoritative even if rendering fails.
+            *r = next;
+            atomic_write(&dir.join(format!("{}.md", r.id)), r.markdown().as_bytes())?;
+            return Ok(());
+        }
+    }
+    *r = next;
+    Ok(())
+}
 pub struct RecordingStore {
     dir: PathBuf,
     file: Option<std::fs::File>,
@@ -259,6 +380,14 @@ impl RecordingStore {
             status: RecordingStatus::Recording,
             duration_ms: recording.duration_ms,
         })?;
+        if recording.detect_speakers {
+            let change = crate::speakers::Change::Resumed;
+            self.append(&PipelineEvent::Speaker {
+                id: recording.id.clone(),
+                change: change.clone(),
+            })?;
+            crate::speakers::apply(recording, &change);
+        }
         recording.status = RecordingStatus::Recording;
         recording.exported = false;
         Ok(())
@@ -303,30 +432,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
-    // MoveFileExW provides replacement on Windows, where fs::rename refuses an existing target.
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::{
-            Win32::Storage::FileSystem::{
-                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-            },
-            core::PCWSTR,
-        };
-        let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        unsafe {
-            MoveFileExW(
-                PCWSTR(from.as_ptr()),
-                PCWSTR(to.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        }
-        .map_err(std::io::Error::other)?;
-    }
-    #[cfg(not(windows))]
-    fs::rename(temp, path)?;
-    Ok(())
+    replace_file(&temp, path)
 }
 fn replay(path: &Path, load_segments: bool) -> std::io::Result<Recording> {
     let mut recording: Option<Recording> = None;
@@ -375,7 +481,17 @@ fn replay(path: &Path, load_segments: bool) -> std::io::Result<Recording> {
                     r.title = title;
                 }
             }
-            PipelineEvent::Deleted { .. } => {}
+            PipelineEvent::Speaker { id, change } => {
+                if let Some(r) = recording.as_mut().filter(|r| r.id == id) {
+                    crate::speakers::apply(r, &change);
+                }
+            }
+            PipelineEvent::TranscriptEdited { id, correction } => {
+                if let Some(r) = recording.as_mut().filter(|r| r.id == id) {
+                    crate::editing::apply(r, &correction);
+                }
+            }
+            PipelineEvent::Deleted { .. } | PipelineEvent::TranscriptUpdated { .. } => {}
         }
     }
     let mut r = recording.ok_or_else(|| std::io::Error::other("Recording header is missing"))?;
@@ -389,6 +505,13 @@ fn replay(path: &Path, load_segments: bool) -> std::io::Result<Recording> {
         r.warnings
             .push("Interrupted recording. Recovered all intact saved results.".into());
     }
+    // A loaded journal has no active worker, including after an interrupted recording.
+    if r.detect_speakers {
+        r.speaker_finished = true;
+    }
+    if !load_segments {
+        r = r.metadata();
+    }
     Ok(r)
 }
 pub fn load_recording(meta: &Recording) -> std::io::Result<Recording> {
@@ -399,6 +522,7 @@ pub fn load_recording(meta: &Recording) -> std::io::Result<Recording> {
                 .nth(index)
                 .ok_or_else(|| std::io::Error::other("Legacy session is missing"))?;
             r.title = meta.title.clone();
+            crate::editing::load_legacy_edits(&mut r)?;
             return Ok(r);
         }
         return replay(path, true);
@@ -440,6 +564,7 @@ pub fn library(dir: &Path) -> std::io::Result<Vec<Recording>> {
                 .is_some_and(|n| n.starts_with("transcript-") && n.ends_with(".md"))
             {
                 for mut r in legacy(&path)? {
+                    crate::editing::load_legacy_edits(&mut r)?;
                     r.segments.clear();
                     result.push(r);
                 }
@@ -569,7 +694,8 @@ pub fn delete(recording: &Recording, dir: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let files = [dir.join(format!("{}.md", recording.id)), journal];
+    let backup = journal.with_extension("recovery-backup");
+    let files = [dir.join(format!("{}.md", recording.id)), backup, journal];
     for path in &files {
         match fs::metadata(path) {
             Ok(metadata) => {
@@ -880,4 +1006,32 @@ mod deletion_tests {
         assert_eq!(fs::read_to_string(outside).unwrap(), "Unrelated data");
         clean_up(&root);
     }
+}
+
+/// Publish an already flushed temporary file without exposing a partial target.
+pub fn replace_file(temp: &Path, path: &Path) -> std::io::Result<()> {
+    // MoveFileExW provides replacement on Windows, where fs::rename refuses an existing target.
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            Win32::Storage::FileSystem::{
+                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            },
+            core::PCWSTR,
+        };
+        let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(std::io::Error::other)?;
+    }
+    #[cfg(not(windows))]
+    fs::rename(temp, path)?;
+    Ok(())
 }

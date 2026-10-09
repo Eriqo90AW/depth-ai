@@ -25,8 +25,10 @@ Depth captures the audio your PC plays and turns it into a searchable recordings
 | --- | --- |
 | English and Indonesian | English uses Whistle; Indonesian uses Whisper with separate live-draft and final-transcription workers. |
 | Live Indonesian drafts | Read revisable text while speech continues. Only final results enter saved transcripts, copy, and export. |
+| Speaker labels | Opt into offline voice grouping, then name speakers, merge duplicate groups, or correct individual turns. |
 | A recordings library | Rename sessions, search their text, switch between paragraph and timed views, and delete recordings with confirmation. |
 | Continue a recording | Append more audio to a completed session. Timestamps continue from its recorded duration, excluding time spent stopped. |
+| Edit finished transcripts | Correct passages in the app, save or discard changes, and retain timestamps and speaker labels. |
 | Copy and export | Copy selected text or an entire recording, include timestamps, and export Markdown or plain text. |
 | Controls wherever you work | Start or stop with `Ctrl+Alt+Space`, the tray menu, or a floating overlay with elapsed time and an Open app button. |
 | Local storage and recovery | Autosave readable Markdown and recovery journals, or keep recordings in memory until you export. |
@@ -44,7 +46,7 @@ This README describes the current **0.1.1 source version**. Build and package fr
 
 Check [GitHub Releases](https://github.com/Eriqo90AW/depth-ai/releases) for a packaged `depth-setup.exe`. If you already have a setup executable, run it and choose your shortcut and startup options. The NSIS installer requests administrator permission and installs into Program Files for all users. An unsigned build may show a Windows SmartScreen prompt.
 
-Installers, downloaded models, and engine binaries are excluded from this repository. The installer scripts bundle Whistle for English, Whisper small for final Indonesian transcription, and Whisper base for Indonesian live drafts.
+Installers, downloaded models, and engine binaries are excluded from this repository. The installer scripts bundle Whistle for English, Maleo Whisper small-id Q8_0 for final Indonesian transcription, Whisper base Q5_1 for live drafts, and local speaker models. Matching CPU and NVIDIA CUDA whisper.cpp runners and their licenses are included. A clean installation can transcribe offline without NVIDIA hardware. Optional checkpoints download separately into each user's data folder.
 
 ### Build from source
 
@@ -85,11 +87,10 @@ You need Windows 10 or 11 x64, PowerShell, Python 3, and Visual Studio Build Too
 3. Download the engines and models, including the Indonesian draft checkpoint.
 
    ```powershell
-   python scripts/fetch_assets.py all --size small
-   python scripts/fetch_assets.py model --size base
+   python scripts/fetch_assets.py all
    ```
 
-   The first command downloads the Whistle engine/model, the whisper.cpp runner, and Whisper small. The second adds Whisper base for live drafts. Downloads require an internet connection; transcription runs offline afterward.
+   This downloads Whistle, the pinned CPU/CUDA runners, Maleo small-id, base drafts, and speaker models/runtime/licenses. Building the offline installer requires these assets. Optional final models can be downloaded later from Settings; transcription stays local.
 
 4. Build, check the assets, and launch Depth.
 
@@ -99,7 +100,7 @@ You need Windows 10 or 11 x64, PowerShell, Python 3, and Visual Studio Build Too
    .\target\release\depth.exe
    ```
 
-   The build helper imports Visual Studio's linker environment. `--check` reports the configuration, model paths, and available engines before you start recording.
+   The build helper imports Visual Studio's linker environment. `--check` reports the configuration, detected NVIDIA device, runtime availability, requested/effective model, and missing model downloads before you start recording.
 
 ## Using Depth
 
@@ -107,7 +108,8 @@ You need Windows 10 or 11 x64, PowerShell, Python 3, and Visual Studio Build Too
 2. Play the audio you want to transcribe and click **Start recording**, or press **Ctrl+Alt+Space**.
 3. Read final text as it arrives. Indonesian also shows a separate **Live draft** that can change as more speech is processed.
 4. Click **Stop recording**. Depth shows **Finishing** while it processes queued final chunks, then marks the recording complete.
-5. Rename the recording by editing its title and pressing Enter. Use Find, Timed view, Copy text, Copy timestamps, or Export to work with the result.
+5. Rename the recording by editing its title and pressing Enter. After processing finishes, choose **Edit transcript** to correct passages, then **Save changes**. Saved edits update Find, Timed view, copy, and export. **Cancel** lets you keep editing or discard unsaved changes.
+6. Use Find, Timed view, Copy text, Copy timestamps, or Export to work with the result.
 6. Select a completed recording and choose **Continue recording** to append to it, or **New recording** for a separate session.
 
 While you read earlier text, incoming results preserve your selection and scroll position. **Jump to latest** returns to the end. Closing the window keeps Depth in the tray; use **Quit Depth** or the tray's Quit action to exit.
@@ -120,9 +122,23 @@ While you read earlier text, incoming results preserve your selection and scroll
 
 New recordings save to `Documents\Depth\transcripts` by default. With autosave off, recordings remain in memory until you export them, and quitting prompts you to review unsaved work. Deleting a saved recording removes its transcript; deleting an imported legacy session removes it from the library while keeping its shared source file.
 
+Corrections to autosaved recordings survive restarts. With autosave off, edits stay in memory until you export. Imported legacy sessions store corrections separately without changing their shared source document. Continuing a recording retains saved corrections. Edited passages keep their original timing anchors; manually entered words do not have individual ASR timings.
+
+### Speaker labels and names
+
+Enable **Settings → Detect speakers** before starting a new recording. It is off by default. Speech recognition and speaker detection run on your computer; they use no external inference API. Speaker models load only for recordings with detection enabled.
+
+Text appears immediately with **Identifying speaker** while analysis catches up. Detection analyzes overlapping ten-second windows every five seconds, so the first labels need about ten seconds of captured audio. Voices get recording-specific labels such as **Speaker 1**. Uncertain speech, missing timing evidence, and overlapping voices retain **Unknown speaker**.
+
+After Stop finishes processing, choose **Speakers** to rename a voice, merge a duplicate group into a chosen speaker, or choose a transcript turn and assign its speaker. These changes update paragraph/timed views, Find, copy, Markdown, and plain-text exports. Corrections take precedence over automatic updates. Continuing the same recording reuses its voice profiles, names, and corrections; unrelated recordings start with fresh identities. Old recordings keep their existing appearance.
+
+With autosave enabled, names and voice embeddings stay in the recording's local recovery journal. Deleting that recording removes its journal, any recovery backup, and saved Markdown. With autosave off, this metadata stays in memory until the app closes. Text exports contain resolved names, without voice embeddings. The speaker worker holds bounded audio windows in memory and does not save recording audio.
+
+For a source checkout missing these assets, run `python scripts/fetch_assets.py speakers`. Missing models or detection failures show a notice and preserve the transcription. See [speaker verification](docs/speaker-verification.md) for tests, Windows throughput measurements, and accuracy limits.
+
 ## Settings
 
-Open **Settings** for language, desktop audio source, autosave, recording on launch, the global hotkey, appearance, floating controls, and completion notifications. Appearance changes apply immediately. Capture, engine, and autosave changes apply to the next recording. Engine and capture tuning are available under **Advanced**.
+Open **Settings** for language, desktop audio source, speaker detection, autosave, recording on launch, the global hotkey, appearance, floating controls, and completion notifications. Appearance changes apply immediately. Capture, engine, and autosave changes apply to the next recording. Engine and capture tuning are available under **Advanced**.
 
 Preferences are stored in `Documents\Depth\config.toml`. These defaults match the current source:
 
@@ -137,7 +153,9 @@ Preferences are stored in `Documents\Depth\config.toml`. These defaults match th
 | `show_result_popup` | `true` | Notify when transcription finishes. |
 | `indicator_position` | `"bottom-right"` | Overlay corner; also accepts `"bottom-left"`, `"top-right"`, or `"top-left"`. |
 | `whistle_model` | `"whistle.cact"` | English speech model. |
-| `whisper_model` | `"ggml-small-q5_1.bin"` | Final Indonesian transcription model. |
+| `indonesian_processing` | `"auto"` | Try NVIDIA CUDA, with CPU fallback; also accepts `"nvidia"` and `"cpu"`. |
+| `indonesian_model` | `"recommended"` | Device recommendation, a catalog ID, or `"custom"`. |
+| `whisper_model` | `"ggml-small-q5_1.bin"` | Preserved legacy/custom checkpoint path, used with Custom. |
 | `whisper_draft_model` | `"ggml-base-q5_1.bin"` | Indonesian live-draft model. |
 | `whisper_threads` | `0` | Allocate threads automatically for draft/final workers; a positive value applies to both. |
 | `keywords` | `[]` | Names and phrases to favor during decoding. |
@@ -165,16 +183,27 @@ Omit `audio_output_device` to use **Windows default**. Selecting a specific devi
 
 ### Choosing Indonesian models
 
-The asset helper supports these quantized multilingual Whisper checkpoints. Sizes are approximate download sizes, not total memory usage.
+Choose **Settings → Speech recognition** to select Auto, NVIDIA GPU, or CPU and a final model. The detected GPU and the device actually processing the recording appear there. Drafts always use base on CPU; English stays on Whistle.
 
-| Size | Model file | Approximate size | Use |
+**Recommended for this device** starts with bundled Maleo small-id. Its output is lowercase without punctuation. On an NVIDIA GPU with at least 4 GiB VRAM, **Download recommended model** offers stock large-v3-turbo Q5_0. Downloads are opt-in. Select **Use downloaded model**, then **Save settings** to apply an explicit choice to the next recording. Downloading while recording does not switch the current model.
+
+Turbo becomes eligible for Recommended only after a recording processes at least 30 seconds on CUDA, averages faster than incoming audio including per-chunk loading, and has no dropped final chunks. This RTX 2060's tested runtime did not pass; small-id remains its recommendation. See [GPU/model verification](docs/gpu-model-verification.md) for measurements and remaining validation limits.
+
+| Catalog ID | Checkpoint | Download size | Output/use |
 | --- | --- | --- | --- |
-| `tiny` | `ggml-tiny-q5_1.bin` | 31 MB | Smaller final-transcription option. |
-| `base` | `ggml-base-q5_1.bin` | 57 MB | Default live-draft checkpoint; can also be used for final results. |
-| `small` | `ggml-small-q5_1.bin` | 181 MB | Default final-transcription checkpoint. |
-| `medium` | `ggml-medium-q5_0.bin` | 539 MB | Larger final-transcription option with more CPU work. |
+| `base` | Stock base Q5_1 | 57 MiB | Bundled CPU drafts; lighter final option. |
+| `small` | Stock small Q5_1 | 181 MiB | Multilingual final results with punctuation. |
+| `medium` | Stock medium Q5_0 | 515 MiB | Larger multilingual final model. |
+| `turbo` | Stock large-v3-turbo Q5_0 | 547 MiB | GPU upgrade candidate; device qualification required for Recommended. |
+| `large-v3` | Stock large-v3 Q5_0 | 1.01 GiB | Largest catalog option; heavier processing. |
+| `small-id` | Maleo Indonesian small Q8_0 | 252 MiB | Bundled final starter; lowercase, no punctuation. |
+| `medium-id` | Cahya Indonesian medium Q5_0 | 515 MiB | Indonesian fine-tune; heavier than the starter. |
 
-Download another checkpoint with `python scripts/fetch_assets.py model --size medium`, then change `whisper_model` in Advanced settings or `config.toml`. Bare model filenames are resolved against the executable, data directory, working directory, and their model/vendor locations.
+Sizes describe checkpoint downloads, not inference memory. The shared [catalog](assets/asr-models.json) pins revisions, SHA-256 hashes, sizes, and license/source attribution. Downloads show progress, can be cancelled, and can be retried. Files become installed only after size/checksum verification and atomic publication; interrupted `.part` files are replaced on retry.
+
+If CUDA initialization or inference fails, Depth reaps that runner, discards its partial text, and retries the same audio once with bundled small-id on CPU. One recording notice explains the reason and effective model. Remaining chunks use CPU; the next recording tries your saved preference again. Choose CPU to bypass GPU attempts. Custom executable paths are preserved and run with GPU disabled.
+
+Configurations saved before model selection retain their previous `whisper_model`, draft, and executable paths as **Custom**. Set `whisper_model` in Advanced when using Custom. The processing/model dropdowns own their values; Advanced TOML cannot override them. Downloaded models live in `Documents\Depth\models` (or your `--home` folder), and survive application upgrades/uninstallation.
 
 Indonesian drafts are requested after two seconds of speech and every two seconds afterward. These are scheduling intervals; inference time depends on the model and CPU. Final chunks close on silence or at six seconds. A missing draft checkpoint shows a notice while final transcription continues.
 
@@ -186,6 +215,8 @@ The default data directory is `Documents\Depth`:
 Depth/
 ├── config.toml                  Preferences
 ├── depth.log                    Diagnostics
+├── models/                      Verified optional ASR downloads
+├── turbo-qualified.json         Device-specific turbo speed check
 ├── scratch/                     Engine working files, including audio chunks
 └── transcripts/
     ├── <recording-ID>.md         Readable final transcript
@@ -206,7 +237,7 @@ flowchart LR
     A[Desktop playback] --> B[Windows loopback capture]
     B --> C[16 kHz mono and speech segmentation]
     C --> D[Whistle: English]
-    C --> E[Whisper small: Indonesian]
+    C --> E[Selected Whisper: Indonesian CPU/CUDA]
     C --> G[Whisper base: Indonesian drafts]
     D --> F[Final transcript]
     E --> F
@@ -256,6 +287,7 @@ The helper uses `.scratch/dev` and a separate executable. Sample preview modes d
 | --- | --- | --- |
 | `whistle-sidecar` | On | English via the prebuilt Cactus `needle.exe`. |
 | `whisper-sidecar` | On | Indonesian via the prebuilt `whisper-cli.exe`. |
+| `speakers` | On | Official Sherpa-ONNX CPU runtime; detection remains opt-in in Settings. |
 | `tray` | On | Slint interface, tray, hotkey, and shell integration. |
 | `whistle` | Off | In-process Cactus engine; requires a compatible libc++ toolchain. |
 | `whisper` | Off | In-process Whisper through `whisper-rs`; requires CMake and C++ build tools. |
@@ -277,7 +309,7 @@ Push-Location installer
 try { ..\.toolchain\nsis\makensis.exe depth.nsi } finally { Pop-Location }
 ```
 
-This produces `dist\depth-setup.exe` with Whistle, Whisper small, and Whisper base, including Indonesian live drafts. [installer/depth.iss](installer/depth.iss) is retained as an alternative/reference script; both scripts use the same output filename.
+This produces `dist\depth-setup.exe` with Whistle, Whisper small, Whisper base, Pyannote segmentation, NeMo TitaNet small, and the matching Sherpa-ONNX runtime/license files. [installer/depth.iss](installer/depth.iss) is retained as an alternative/reference script; both scripts use the same output filename.
 
 The icon assets are checked in. To regenerate them, install Pillow for Python and run `python scripts/make_icon.py`. The Rust build embeds the icon and version directly through [build/winres.rs](build/winres.rs).
 
@@ -288,6 +320,7 @@ The icon assets are checked in. To regenerate them, install Pillow for Python an
 | `link.exe` not found | Install the Visual Studio C++ workload and build through `scripts/dev-shell.ps1`. |
 | Rust toolchain missing | Run the workspace-local Rust setup above; the helper uses `.toolchain/cargo` and `.toolchain/rustup`. |
 | Missing Whistle or Whisper assets | Run `python scripts/fetch_assets.py all --size small`, then `depth.exe --check`. |
+| Speaker labels show Unknown or a model notice | Install `python scripts/fetch_assets.py speakers`; transcription remains available. Very short, similar, or overlapping voices may need manual correction. |
 | Indonesian finals work, but live drafts are unavailable | Download `python scripts/fetch_assets.py model --size base` and check `whisper_draft_model`. |
 | No text appears | Check playback/player mute and routing, then select Windows default. Older Windows or a specific-device source may require unmuted speakers. The status bar reports the active source and silence guidance. |
 | The hotkey does nothing | Check the registered hotkey shown in Settings and the log for a conflict with another app. |

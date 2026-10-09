@@ -59,6 +59,70 @@ impl Language {
     }
 }
 
+/// Indonesian final-inference preference; live drafts always run on CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Processing {
+    #[default]
+    Auto,
+    Nvidia,
+    Cpu,
+}
+
+/// Saved Indonesian model choice, with stable catalog identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelSelection {
+    #[default]
+    Recommended,
+    Custom,
+    Base,
+    Small,
+    Medium,
+    Turbo,
+    #[serde(rename = "large-v3")]
+    LargeV3,
+    SmallId,
+    MediumId,
+}
+impl ModelSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recommended => "recommended",
+            Self::Custom => "custom",
+            Self::Base => "base",
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Turbo => "turbo",
+            Self::LargeV3 => "large-v3",
+            Self::SmallId => "small-id",
+            Self::MediumId => "medium-id",
+        }
+    }
+}
+impl std::str::FromStr for ModelSelection {
+    type Err = anyhow::Error;
+    fn from_str(id: &str) -> Result<Self, Self::Err> {
+        Ok(match id {
+            "recommended" => Self::Recommended,
+            "custom" => Self::Custom,
+            "base" => Self::Base,
+            "small" => Self::Small,
+            "medium" => Self::Medium,
+            "turbo" => Self::Turbo,
+            "large-v3" => Self::LargeV3,
+            "small-id" => Self::SmallId,
+            "medium-id" => Self::MediumId,
+            _ => anyhow::bail!("Unknown Indonesian model: {id}"),
+        })
+    }
+}
+impl std::fmt::Display for ModelSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Which corner of the usable screen area the on-screen indicator is anchored to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -137,6 +201,9 @@ pub struct Config {
     pub whisper_model: PathBuf,
     /// Smaller multilingual checkpoint used for transient Indonesian live drafts.
     pub whisper_draft_model: PathBuf,
+    pub indonesian_processing: Processing,
+    /// Catalog id, recommended, or custom for the legacy whisper_model path.
+    pub indonesian_model: ModelSelection,
     /// None follows the Windows default output; otherwise a WASAPI endpoint ID.
     pub audio_output_device: Option<String>,
     /// The whisper.cpp command line runner, used by the `whisper-sidecar` build.
@@ -165,6 +232,10 @@ pub struct Config {
     pub whistle_decoder_depth: Option<u8>,
     /// Ask the engine for per-word timings as well as text.
     pub word_timestamps: bool,
+    /// Optional local speaker detection, applied to new recordings.
+    pub detect_speakers: bool,
+    pub speaker_segmentation_model: PathBuf,
+    pub speaker_embedding_model: PathBuf,
     /// Global hotkey that toggles listening, e.g. `"Win+P"` or `"Ctrl+Alt+Space"`.
     pub hotkey: String,
     /// Tried when `hotkey` cannot be registered; Windows keeps some `Win`+key combos for itself.
@@ -207,6 +278,8 @@ impl Default for Config {
             needle_exe: PathBuf::from("needle.exe"),
             whisper_model: PathBuf::from("ggml-small-q5_1.bin"),
             whisper_draft_model: PathBuf::from("ggml-base-q5_1.bin"),
+            indonesian_processing: Processing::Auto,
+            indonesian_model: ModelSelection::Recommended,
             audio_output_device: None,
             whisper_exe: PathBuf::from("whisper-cli.exe"),
             keywords: Vec::new(),
@@ -221,6 +294,9 @@ impl Default for Config {
             queue_capacity: 8,
             whistle_decoder_depth: None,
             word_timestamps: false,
+            detect_speakers: false,
+            speaker_segmentation_model: PathBuf::from("speaker-segmentation.int8.onnx"),
+            speaker_embedding_model: PathBuf::from("nemo_en_titanet_small.onnx"),
             hotkey: "Ctrl+Alt+Space".to_string(),
             hotkey_fallback: "Ctrl+Alt+Space".to_string(),
             start_listening: false,
@@ -323,8 +399,13 @@ impl Config {
         let path = base_dir.join("config.toml");
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            toml::from_str::<Config>(&raw)
-                .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display()))?
+            let mut loaded = toml::from_str::<Config>(&raw)
+                .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display()))?;
+            let value: toml::Value = toml::from_str(&raw)?;
+            if value.get("indonesian_model").is_none() {
+                loaded.indonesian_model = ModelSelection::Custom;
+            }
+            loaded
         } else {
             let defaults = Config::default();
             std::fs::create_dir_all(&base_dir)?;
@@ -336,6 +417,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !matches!(self.indonesian_model.as_str(), "recommended" | "custom") {
+            crate::models::get(self.indonesian_model.as_str())?;
+        }
         crate::hotkey::parse(&self.hotkey)?;
         crate::hotkey::parse(&self.hotkey_fallback)?;
         anyhow::ensure!(
@@ -462,11 +546,19 @@ impl Config {
                 "Whistle",
                 "Run `python scripts/fetch_assets.py whistle`.",
             ),
-            Language::Id => self.resolve_model(
-                &self.whisper_model,
-                "Whisper",
-                "Run `python scripts/fetch_assets.py whisper --size small`.",
-            ),
+            Language::Id => {
+                let gpu = crate::gpu::discover();
+                crate::models::selected(
+                    self,
+                    gpu.device.as_ref(),
+                    crate::models::cuda_runtime_exists(self),
+                )
+                .map_err(|e| MissingModel {
+                    what: "Indonesian",
+                    searched: vec![self.base_dir.join("models")],
+                    hint: e.to_string(),
+                })
+            }
         }
     }
 
@@ -502,6 +594,7 @@ mod tests {
     fn default_config_is_coherent() {
         let cfg = Config::default();
         assert_eq!(cfg.language, Language::En);
+        assert!(!cfg.detect_speakers);
         assert!(
             cfg.max_segment_secs <= 30.0,
             "both engines cap a pass at 30 s"
@@ -515,6 +608,7 @@ mod tests {
         let cfg: Config =
             toml::from_str("language = 'id'\nwhisper_model = 'custom-small.bin'\n").unwrap();
         assert_eq!(cfg.whisper_model, PathBuf::from("custom-small.bin"));
+        assert!(!cfg.detect_speakers);
         assert_eq!(cfg.whisper_draft_model, PathBuf::from("ggml-base-q5_1.bin"));
         assert!(cfg.audio_output_device.is_none());
         let mut cfg = cfg;
@@ -607,5 +701,35 @@ mod validation_tests {
         assert_eq!(c.viewer_theme, ViewerTheme::Dark);
         assert!(!c.save_transcript);
         assert!(!c.reduced_motion);
+    }
+}
+
+#[cfg(test)]
+mod model_migration_tests {
+    use super::*;
+    #[test]
+    fn legacy_paths_survive_loading_and_saving() {
+        let dir =
+            std::env::temp_dir().join(format!("depth-model-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "whisper_model = 'my-custom.bin'\nwhisper_exe = 'my-runner.exe'\nwhisper_draft_model = 'my-preview.bin'\n").unwrap();
+        let (mut config, _) = Config::load(Some(dir.clone())).unwrap();
+        assert_eq!(config.indonesian_model, ModelSelection::Custom);
+        assert_eq!(config.whisper_model, PathBuf::from("my-custom.bin"));
+        assert_eq!(config.whisper_exe, PathBuf::from("my-runner.exe"));
+        assert_eq!(config.whisper_draft_model, PathBuf::from("my-preview.bin"));
+        config.indonesian_processing = Processing::Cpu;
+        config.save().unwrap();
+        let (restored, _) = Config::load(Some(dir.clone())).unwrap();
+        assert_eq!(restored.indonesian_processing, Processing::Cpu);
+        assert_eq!(restored.indonesian_model, ModelSelection::Custom);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn new_defaults_recommend_and_invalid_catalog_selection_fails() {
+        let config = Config::default();
+        assert_eq!(config.indonesian_model, ModelSelection::Recommended);
+        assert_eq!(config.indonesian_processing, Processing::Auto);
+        assert!(toml::from_str::<Config>("indonesian_model = \"no-such-model\"").is_err());
     }
 }

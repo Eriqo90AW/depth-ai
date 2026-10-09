@@ -249,6 +249,46 @@ fn real_main() -> Result<()> {
 /// Report configuration, models and compiled engines.
 fn check(config: &Config, config_path: &Path) -> Result<()> {
     out("depth configuration check");
+    let gpu = depth::gpu::discover();
+    #[cfg(feature = "whisper-sidecar")]
+    let cuda = config.whisper_exe == Path::new("whisper-cli.exe")
+        && depth::engine::whisper_cli::cuda_cli(config).is_some();
+    #[cfg(not(feature = "whisper-sidecar"))]
+    let cuda = false;
+    out(format!(
+        "  GPU             {}",
+        gpu.device.as_ref().map(|g| g.label()).unwrap_or(gpu.reason)
+    ));
+    let cpu = config
+        .resolve_model(
+            Path::new("vendor/whisper/cpu/whisper-cli.exe"),
+            "CPU runtime",
+            "",
+        )
+        .is_ok();
+    out(format!("  CPU runtime     {cpu}"));
+    out(format!(
+        "  CUDA runtime    {cuda}; preference {:?}",
+        config.indonesian_processing
+    ));
+    out(format!("  requested model {}", config.indonesian_model));
+    out(format!(
+        "  effective model {}",
+        depth::models::selected(config, gpu.device.as_ref(), cuda)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| e.to_string())
+    ));
+    for m in depth::models::catalog() {
+        out(format!(
+            "  model {:<12} {}",
+            m.id,
+            if depth::models::installed(config, m).is_some() {
+                "installed"
+            } else {
+                "download in Settings"
+            }
+        ));
+    }
     out(format!("  config file     {}", config_path.display()));
     out(format!("  log file        {}", config.log_path().display()));
     out(format!(
@@ -324,6 +364,24 @@ fn check(config: &Config, config_path: &Path) -> Result<()> {
         config.max_segment_secs
     ));
 
+    out(format!(
+        "  detect speakers {} (local CPU, support={})",
+        config.detect_speakers,
+        cfg!(feature = "speakers")
+    ));
+    if config.detect_speakers {
+        for (spec, name) in [
+            (&config.speaker_segmentation_model, "speaker segmentation"),
+            (&config.speaker_embedding_model, "speaker embeddings"),
+        ] {
+            match config.resolve_model(spec, name, "python scripts/fetch_assets.py speakers") {
+                Ok(path) => out(format!("  {name:<20} {}", path.display())),
+                Err(error) => out(format!(
+                    "  {name:<20} unavailable: {error}; transcription remains enabled"
+                )),
+            }
+        }
+    }
     let mut missing = false;
     for language in Language::all() {
         let (spec, what, hint) = match language {
@@ -338,7 +396,14 @@ fn check(config: &Config, config_path: &Path) -> Result<()> {
                 "python scripts/fetch_assets.py whisper --size small",
             ),
         };
-        match config.resolve_model(spec, what, hint) {
+        let resolved = if language == Language::Id {
+            let mut requested = config.clone();
+            requested.language = language;
+            requested.resolve_active_model()
+        } else {
+            config.resolve_model(spec, what, hint)
+        };
+        match resolved {
             Ok(path) => {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 out(format!(

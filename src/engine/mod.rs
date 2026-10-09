@@ -60,6 +60,15 @@ impl AsrResult {
 pub trait AsrEngine: Send {
     /// Short engine name for the Markdown header and the log.
     fn name(&self) -> &'static str;
+    fn reusable_after_recording(&self) -> bool {
+        true
+    }
+    fn status(&self) -> String {
+        self.name().into()
+    }
+    fn take_notices(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Transcribe 16 kHz mono PCM (at most 30 s) into text.
     fn transcribe(&mut self, pcm: &[f32]) -> anyhow::Result<AsrResult>;
@@ -108,7 +117,10 @@ fn load_english(config: &Config, logger: &Arc<Logger>) -> anyhow::Result<Box<dyn
              the linked engine always runs the model's full decoder depth",
         );
     }
-    Ok(Box::new(whistle::WhistleEngine::new(&path, logger)?))
+    let mut engine = whistle::WhistleEngine::new(&path, logger)?;
+    engine.set_word_timestamps(config.word_timestamps || config.detect_speakers);
+    engine.set_keywords(&config.keywords);
+    Ok(Box::new(engine))
 }
 
 #[cfg(all(feature = "whistle-sidecar", not(feature = "whistle")))]
@@ -139,11 +151,9 @@ fn load_indonesian(config: &Config, logger: &Arc<Logger>) -> anyhow::Result<Box<
             "Run `python scripts/fetch_assets.py model --size small`.",
         )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    Ok(Box::new(whisper::WhisperEngine::new(
-        &path,
-        config.whisper_threads,
-        logger,
-    )?))
+    let mut engine = whisper::WhisperEngine::new(&path, config.whisper_threads, logger)?;
+    engine.set_word_timestamps(config.word_timestamps || config.detect_speakers);
+    Ok(Box::new(engine))
 }
 
 #[cfg(not(any(feature = "whisper", feature = "whisper-sidecar")))]

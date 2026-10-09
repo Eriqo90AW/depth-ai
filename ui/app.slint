@@ -2,6 +2,8 @@ import { Palette, Button, VerticalBox, HorizontalBox, ScrollView, LineEdit, Chec
 import { Theme } from "theme.slint";
 import { CaptionButton } from "chrome.slint";
 export { Theme } from "theme.slint";
+export { SpeakersWindow, SpeakerRow } from "speakers.slint";
+export { TranscriptEditorWindow, EditorRow } from "editor.slint";
 export { SettingsWindow } from "settings.slint";
 export { OverlayWindow } from "overlay.slint";
 export { NotificationWindow } from "notification.slint";
@@ -25,6 +27,10 @@ export component MainWindow inherits Window {
     in property <bool> finishing;
     in property <bool> can-continue;
     in property <bool> can-delete;
+    in property <bool> can-edit;
+    callback edit-transcript();
+    in property <bool> has-speakers;
+    callback manage-speakers();
     in property <bool> legacy-recording;
     in-out property <bool> delete-prompt;
     in property <string> elapsed: "00:00:00";
@@ -62,6 +68,7 @@ export component MainWindow inherits Window {
         if reset { input.set-selection-offsets(0, 0); scroll.content-y = 0px; root.unread = false; }
         else { input.set-selection-offsets(anchor, cursor); if follow { root.jump-latest(); } else { scroll.content-y = y; root.unread = true; } }
     }
+    public function preserve-selection(anchor: int, cursor: int) { root.last-cursor-offset = cursor; input.set-selection-offsets(anchor, cursor); }
     public function jump-latest() { scroll.content-y = min(0px, scroll.visible-height - scroll.content-height); root.unread = false; }
     public function highlight-match(start: int, end: int) { root.last-cursor-offset = -1; input.set-selection-offsets(start, end); }
     public function select-match(start: int, end: int) { input.focus(); root.highlight-match(start, end); }
@@ -119,14 +126,16 @@ export component MainWindow inherits Window {
                 Rectangle { background: Theme.panel; border-radius: 20px; border-width: 1px; border-color: Theme.edge;
                     VerticalBox { padding: root.compact ? 18px : 32px; spacing: root.compact ? 10px : 16px;
                         if root.selected-id != "": VerticalBox { spacing: 8px;
-                            HorizontalBox { padding: 0px; spacing: 8px;
-                                title-edit := LineEdit { text <=> root.recording-title; accepted => { root.rename-recording(root.recording-title); } }
+                            HorizontalBox { min-width: 0px; preferred-width: 0px; padding: 0px; spacing: 8px;
+                                title-edit := LineEdit { min-width: 0px; preferred-width: 0px; text <=> root.recording-title; accepted => { root.rename-recording(root.recording-title); } }
+                                Button { text: "Edit transcript"; enabled: root.can-edit; clicked => { root.edit-transcript(); } }
                                 Button { text: "Delete"; accessible-label: "Delete recording"; enabled: root.can-delete; clicked => { root.delete-prompt = true; } }
                             }
                             Text { text: root.detail; color: Theme.muted; font-size: 12px; }
                             if !root.delete-prompt: HorizontalBox { spacing: 8px;
                                 Button { text: "Copy text"; clicked => { root.copy-document(false); } }
                                 Button { text: "Copy timestamps"; clicked => { root.copy-document(true); } }
+                                if root.has-speakers: Button { text: "Speakers"; clicked => { root.manage-speakers(); } }
                                 Button { text: "Export"; clicked => { root.exporting = !root.exporting; } }
                                 CheckBox { text: "Timed view"; checked <=> root.timed; toggled => { root.view-timed(root.timed); } }
                             }

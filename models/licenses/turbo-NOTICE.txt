@@ -1,0 +1,4 @@
+Whisper large-v3-turbo
+Source: https://huggingface.co/ggerganov/whisper.cpp
+Revision: 5359861c739e955e79d9a303bcbc70fb988958b1
+License: MIT

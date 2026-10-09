@@ -43,7 +43,7 @@ InstallDir "$PROGRAMFILES64\depth"
 InstallDirRegKey HKLM "Software\${APPNAME}" "InstallDir"
 RequestExecutionLevel admin
 
-; The 181 MB checkpoint is already quantised, so zlib keeps the build quick without losing
+; The starter checkpoints are already quantised, so zlib keeps the build quick without losing
 ; meaningful size over LZMA.
 SetCompressor zlib
 
@@ -84,18 +84,34 @@ Section "Application, English transcription and Indonesian transcription with li
   SetOutPath "$INSTDIR"
   File "..\target\release\${APPEXE}"
   File "..\README.md"
+  ; The official Rust crate copies the matching CPU runtime beside the built executable.
+  File "..\target\release\sherpa-onnx-c-api.dll"
+  File "..\target\release\onnxruntime.dll"
+  File "..\target\release\onnxruntime_providers_shared.dll"
+  SetOutPath "$INSTDIR\vendor\speakers\licenses"
+  File "..\vendor\speakers\licenses\*"
+  SetOutPath "$INSTDIR"
   ; Layout matters: the app resolves its engines relative to the executable.
   SetOutPath "$INSTDIR\models"
   File "..\models\whistle.cact"
+  File "..\models\speaker-segmentation.int8.onnx"
+  File "..\models\nemo_en_titanet_small.onnx"
   SetOutPath "$INSTDIR\vendor\needle\windows-x86_64"
   File "..\vendor\needle\windows-x86_64\needle.exe"
   ; Indonesian: final and draft checkpoints plus the ggml runtime DLLs beside the CLI.
   SetOutPath "$INSTDIR\models"
-  File "..\models\ggml-small-q5_1.bin"
+  File "..\models\ggml-small-id-q8_0.bin"
   File "..\models\ggml-base-q5_1.bin"
-  SetOutPath "$INSTDIR\vendor\whisper"
-  File "..\vendor\whisper\Release\whisper-cli.exe"
-  File "..\vendor\whisper\Release\*.dll"
+  SetOutPath "$INSTDIR\vendor\whisper\cpu"
+  File "..\vendor\whisper\cpu\whisper-cli.exe"
+  File "..\vendor\whisper\cpu\*.dll"
+  SetOutPath "$INSTDIR\vendor\whisper\cuda"
+  File "..\vendor\whisper\cuda\whisper-cli.exe"
+  File "..\vendor\whisper\cuda\*.dll"
+  SetOutPath "$INSTDIR\vendor\whisper\licenses"
+  File "..\vendor\whisper\licenses\*"
+  SetOutPath "$INSTDIR\models\licenses"
+  File "..\models\licenses\*"
 SectionEnd
 
 Section "Desktop shortcut (all users)" SEC_DESKTOP
@@ -154,7 +170,7 @@ Section -Registration
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "The application, the Cactus engine with the Whistle model for English, and Whisper small plus base for Indonesian final results and live drafts."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "The application, the Cactus engine with the Whistle model for English, and Indonesian Whisper small plus base, with optional NVIDIA acceleration for Indonesian final results and CPU live drafts."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} "Put a shortcut on every user's desktop."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTMENU} "Add entries to the all-users Start Menu."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTUP} "Launch when any user signs in. It starts idle and records nothing until the hotkey is pressed."

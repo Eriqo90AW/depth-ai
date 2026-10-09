@@ -11,6 +11,7 @@ export component SettingsWindow inherits Window {
     in-out property <int> output-device;
     in-out property <int> theme;
     in-out property <bool> autosave;
+    in-out property <bool> detect-speakers;
     in-out property <bool> startup;
     in-out property <bool> overlay;
     in-out property <bool> notifications;
@@ -22,6 +23,21 @@ export component SettingsWindow inherits Window {
     in-out property <string> advanced;
     in-out property <string> error;
     in-out property <bool> show-advanced;
+    in-out property <int> processing;
+    in property <[string]> asr-models;
+    in property <[string]> asr-model-ids;
+    in-out property <int> asr-model;
+    in-out property <string> gpu-status;
+    in-out property <string> inference-status;
+    in-out property <string> model-details;
+    in-out property <string> download-status;
+    in-out property <bool> downloading;
+    in-out property <bool> can-use-downloaded;
+    callback model-selected();
+    callback download-model();
+    callback download-recommended();
+    callback cancel-download();
+    callback use-downloaded();
     callback save-settings();
     callback appearance(int, bool, bool);
     VerticalBox {
@@ -39,6 +55,24 @@ export component SettingsWindow inherits Window {
                 Text { text: "Desktop audio source"; color: Theme.ink; }
                 ComboBox { model: root.output-devices; current-index <=> root.output-device; accessible-label: "Desktop audio source"; }
                 Text { text: "Windows default captures desktop playback even with speakers muted on supported Windows versions. Selecting a device captures only that output."; wrap: word-wrap; color: Theme.muted; }
+                Text { text: "Speech recognition"; font-size: 18px; font-weight: 600; color: Theme.ink; }
+                Text { text: "English uses Whistle. These controls apply to Indonesian final transcripts; live drafts always use CPU."; wrap: word-wrap; color: Theme.muted; }
+                Text { text: "Indonesian processing"; color: Theme.ink; }
+                ComboBox { model: ["Auto", "NVIDIA GPU", "CPU"]; current-index <=> root.processing; accessible-label: "Indonesian processing device"; selected => { root.model-selected(); } }
+                Text { text: root.gpu-status; wrap: word-wrap; color: Theme.muted; }
+                Text { text: root.inference-status; wrap: word-wrap; color: Theme.muted; }
+                Text { text: "Indonesian model"; color: Theme.ink; }
+                ComboBox { model: root.asr-models; current-index <=> root.asr-model; accessible-label: "Indonesian transcription model"; selected => { root.model-selected(); } }
+                Text { text: root.model-details; wrap: word-wrap; color: Theme.muted; }
+                HorizontalBox {
+                    Button { text: "Download selected model"; enabled: !root.downloading && root.asr-model != 1; clicked => { root.download-model(); } }
+                    Button { text: "Download recommended model"; enabled: !root.downloading; clicked => { root.download-recommended(); } }
+                }
+                if root.downloading: Button { text: "Cancel download"; clicked => { root.cancel-download(); } }
+                if root.can-use-downloaded: Button { text: "Use downloaded model"; clicked => { root.use-downloaded(); } }
+                Text { text: root.download-status; wrap: word-wrap; color: Theme.muted; }
+                CheckBox { text: "Detect speakers on this computer"; checked <=> root.detect-speakers; }
+                Text { text: "Speaker labels appear during recording. After stopping, open Speakers to name or correct them. Adds CPU work; audio stays on this computer."; wrap: word-wrap; color: Theme.muted; }
                 CheckBox { text: "Automatically save recordings"; checked <=> root.autosave; }
                 CheckBox { text: "Start recording when Depth launches"; checked <=> root.startup; }
                 Text { text: "Global hotkey"; color: Theme.ink; }

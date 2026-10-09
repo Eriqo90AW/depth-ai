@@ -16,8 +16,12 @@ pub struct LiveState {
     pub drafts: BTreeMap<u64, Draft>,
     retired: BTreeSet<u64>,
     pub source: String,
+    pub capture_mode: Option<crate::capture::CaptureMode>,
+    pub endpoint: Option<crate::capture::OutputDevice>,
+    pub fallback_reason: Option<crate::capture::FallbackReason>,
     pub capture_error: Option<String>,
     pub notice: String,
+    pub inference: String,
     pub capture_notice: String,
     pub packets: u64,
     pub peak_db: f32,
@@ -34,8 +38,12 @@ impl Default for LiveState {
             drafts: BTreeMap::new(),
             retired: BTreeSet::new(),
             source: String::new(),
+            capture_mode: None,
+            endpoint: None,
+            fallback_reason: None,
             capture_error: None,
             notice: String::new(),
+            inference: String::new(),
             capture_notice: String::new(),
             packets: 0,
             peak_db: f32::NEG_INFINITY,
@@ -48,6 +56,28 @@ impl Default for LiveState {
 }
 
 impl LiveState {
+    pub fn capture_update(&mut self, update: crate::capture::CaptureUpdate) {
+        match update {
+            crate::capture::CaptureUpdate::Source(device) => self.source = device.name,
+            crate::capture::CaptureUpdate::Mode {
+                mode,
+                endpoint,
+                reason,
+            } => {
+                if reason == Some(crate::capture::FallbackReason::DefaultSilent) {
+                    self.source = format!("Using output capture: {}", endpoint.name);
+                }
+                self.capture_mode = Some(mode);
+                self.endpoint = Some(endpoint);
+                self.fallback_reason = reason;
+            }
+            crate::capture::CaptureUpdate::Level { packets, peak_db } => {
+                self.level(packets, peak_db)
+            }
+            crate::capture::CaptureUpdate::Notice(message) => self.capture_notice = message,
+        }
+    }
+
     pub fn begin(&mut self, id: String) {
         *self = Self {
             recording_id: id,
@@ -114,7 +144,7 @@ impl LiveState {
         }
         let mut messages = Vec::new();
         if capturing && self.waiting_for_audio() {
-            messages.push("Waiting for desktop audio. Check browser playback, the player and tab mute settings, and Windows per-app output routing.".to_string());
+            messages.push("Waiting for desktop audio. Check playback in your meeting app or browser, its selected speakers, mute settings, and Windows per-app output routing.".to_string());
         }
         if !self.notice.is_empty() {
             messages.push(self.notice.clone());
@@ -169,5 +199,70 @@ mod tests {
         assert!(!s.waiting_for_audio());
         s.capture_error = Some("Selected output is disconnected".into());
         assert!(s.guidance().contains("disconnected"));
+    }
+}
+
+#[cfg(test)]
+mod capture_status_tests {
+    use super::*;
+    use crate::capture::{CaptureMode, CaptureUpdate, FallbackReason, OutputDevice};
+    #[test]
+    fn fallback_feedback_keeps_structured_endpoint_and_recovers_to_default() {
+        let mut live = LiveState::default();
+        let output = OutputDevice {
+            id: "realtek-id".into(),
+            name: "Speaker (Realtek(R) Audio)".into(),
+        };
+        live.capture_update(CaptureUpdate::Source(output.clone()));
+        live.capture_update(CaptureUpdate::Mode {
+            mode: CaptureMode::Output,
+            endpoint: output,
+            reason: Some(FallbackReason::DefaultSilent),
+        });
+        live.capture_update(CaptureUpdate::Notice(
+            "Keep this output unmuted while recording.".into(),
+        ));
+        assert_eq!(
+            live.source,
+            "Using output capture: Speaker (Realtek(R) Audio)"
+        );
+        assert_eq!(live.endpoint.as_ref().unwrap().id, "realtek-id");
+        assert_eq!(live.capture_mode, Some(CaptureMode::Output));
+        assert_eq!(live.fallback_reason, Some(FallbackReason::DefaultSilent));
+        assert!(live.guidance().contains("unmuted"));
+        let default = OutputDevice {
+            id: "default-id".into(),
+            name: "Desktop audio before speaker mute".into(),
+        };
+        live.capture_update(CaptureUpdate::Source(default.clone()));
+        live.capture_update(CaptureUpdate::Mode {
+            mode: CaptureMode::Desktop,
+            endpoint: default,
+            reason: Some(FallbackReason::EndpointDisconnected),
+        });
+        live.capture_update(CaptureUpdate::Notice(String::new()));
+        assert_eq!(live.capture_mode, Some(CaptureMode::Desktop));
+        assert_eq!(
+            live.fallback_reason,
+            Some(FallbackReason::EndpointDisconnected)
+        );
+        assert!(!live.source.contains("Using output capture"));
+        assert!(!live.guidance().contains("unmuted"));
+    }
+    #[test]
+    fn explicit_outputs_keep_their_source_label_and_have_no_fallback_reason() {
+        let mut live = LiveState::default();
+        let output = OutputDevice {
+            id: "explicit".into(),
+            name: "My speakers".into(),
+        };
+        live.capture_update(CaptureUpdate::Source(output.clone()));
+        live.capture_update(CaptureUpdate::Mode {
+            mode: CaptureMode::Output,
+            endpoint: output,
+            reason: None,
+        });
+        assert_eq!(live.source, "My speakers");
+        assert_eq!(live.fallback_reason, None);
     }
 }

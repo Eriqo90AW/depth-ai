@@ -6,7 +6,7 @@ use crate::{
     pipeline::{self, Control, PipelineHandle},
     recording::{self, PipelineEvent, Recording, RecordingStatus, TranscriptSegment},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use slint::{ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 use std::{
     cell::RefCell,
@@ -18,10 +18,16 @@ use std::{
 slint::include_modules!();
 struct App {
     config: Config,
+    downloads: crate::models::Downloads,
+    downloaded: Option<String>,
+    gpu: crate::gpu::Discovery,
+    gpu_rx: crossbeam_channel::Receiver<crate::gpu::Discovery>,
     pipeline: Option<PipelineHandle>,
     keys: Option<hotkey::Hotkey>,
     library: Vec<Recording>,
     selected: Option<Recording>,
+    speaker_window: Option<SpeakersWindow>,
+    editor: Option<TranscriptEditor>,
     quitting: bool,
     started: Option<Instant>,
     started_duration_ms: u64,
@@ -29,6 +35,153 @@ struct App {
     search_query: String,
     completion_id: String,
     notification_until: Option<Instant>,
+}
+struct TranscriptEditor {
+    window: TranscriptEditorWindow,
+    id: String,
+    basis: String,
+}
+fn cancel_editor(window: &TranscriptEditorWindow) {
+    if window.get_dirty() {
+        window.set_discard_prompt(true);
+    } else {
+        let _ = window.hide();
+    }
+}
+fn save_editor(ui: &MainWindow, app: &Rc<RefCell<App>>) -> Result<()> {
+    let mut app = app.borrow_mut();
+    let editor = app.editor.as_ref().context("Transcript editor is closed")?;
+    let id = editor.id.clone();
+    let request = crate::editing::Request {
+        basis: editor.basis.clone(),
+        texts: editor
+            .window
+            .get_passages()
+            .iter()
+            .map(|r| r.text.to_string())
+            .collect(),
+    };
+    let result = if let Some(p) = app.pipeline.as_ref().filter(|p| p.recording(&id).is_some()) {
+        p.correct_transcript(&id, request)
+    } else {
+        let meta = app
+            .library
+            .iter_mut()
+            .find(|r| r.id == id)
+            .context("Recording no longer exists")?;
+        let mut full = recording::load_recording(meta)?;
+        let result = crate::editing::correct(&mut full, request, &app.config.transcripts_dir());
+        let meta = app
+            .library
+            .iter_mut()
+            .find(|r| r.id == id)
+            .expect("existing recording");
+        *meta = if full.autosave && full.source.is_some() {
+            full.metadata()
+        } else {
+            full
+        };
+        result
+    };
+    if let Some(full) = app.pipeline.as_ref().and_then(|p| p.recording(&id)) {
+        if let Some(meta) = app.library.iter_mut().find(|r| r.id == id) {
+            *meta = if full.autosave && full.source.is_some() {
+                full.metadata()
+            } else {
+                full
+            };
+        }
+    }
+    fill_library(ui, &app);
+    if ui.get_selected_id().as_str() == id {
+        select(ui, &mut app, &id, false)?;
+    }
+    result?;
+    if let Some(editor) = &app.editor {
+        editor.window.set_dirty(false);
+        editor.window.set_discard_prompt(false);
+        editor.window.hide()?;
+    }
+    Ok(())
+}
+fn open_editor(ui: &MainWindow, app: &Rc<RefCell<App>>) -> Result<()> {
+    if let Some(editor) = &app.borrow().editor {
+        if editor.window.get_dirty() {
+            editor.window.set_error(
+                "Save or discard these changes before opening another transcript.".into(),
+            );
+            editor.window.show()?;
+            return Ok(());
+        }
+    }
+    let r = app
+        .borrow()
+        .selected
+        .clone()
+        .context("Select a finished recording first")?;
+    if !crate::editing::available(&r) {
+        anyhow::bail!("Wait for transcription and speaker detection to finish before editing.");
+    }
+    if app.borrow().editor.is_none() {
+        let window = TranscriptEditorWindow::new()?;
+        let a = Rc::downgrade(app);
+        let u = ui.as_weak();
+        let w = window.as_weak();
+        window.on_save(move || {
+            if let (Some(app), Some(ui), Some(window)) = (a.upgrade(), u.upgrade(), w.upgrade()) {
+                if let Err(e) = save_editor(&ui, &app) {
+                    window.set_error(e.to_string().into());
+                }
+            }
+        });
+        let w = window.as_weak();
+        window.on_cancel(move || {
+            if let Some(w) = w.upgrade() {
+                cancel_editor(&w);
+            }
+        });
+        let w = window.as_weak();
+        window.on_discard(move || {
+            if let Some(w) = w.upgrade() {
+                w.set_dirty(false);
+                w.set_discard_prompt(false);
+                let _ = w.hide();
+            }
+        });
+        let w = window.as_weak();
+        window.window().on_close_requested(move || {
+            if let Some(w) = w.upgrade() {
+                cancel_editor(&w);
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+        app.borrow_mut().editor = Some(TranscriptEditor {
+            window,
+            id: String::new(),
+            basis: String::new(),
+        });
+    }
+    let mut app = app.borrow_mut();
+    let config = app.config.clone();
+    let editor = app.editor.as_mut().expect("created editor");
+    editor.id = r.id.clone();
+    editor.basis = crate::editing::basis(&r);
+    theme(&editor.window, &config);
+    editor.window.set_recording_title(r.title.clone().into());
+    editor.window.set_passages(ModelRc::new(VecModel::from(
+        crate::editing::passages(&r)
+            .into_iter()
+            .map(|p| EditorRow {
+                label: p.label.into(),
+                text: p.text.into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    editor.window.set_dirty(false);
+    editor.window.set_discard_prompt(false);
+    editor.window.set_error("".into());
+    editor.window.show()?;
+    Ok(())
 }
 fn sync_live(ui: &MainWindow, live: Option<&crate::live::LiveState>, active: bool) {
     ui.set_capture_source(
@@ -104,6 +257,190 @@ fn fill_library(ui: &MainWindow, app: &App) {
         .collect::<Vec<_>>();
     ui.set_recordings(ModelRc::new(VecModel::from(rows)));
 }
+fn fill_speakers(window: &SpeakersWindow, r: &Recording) {
+    let speakers = crate::speakers::active_speakers(r);
+    let turns = crate::speakers::display_turns(r);
+    let rows = speakers
+        .iter()
+        .map(|s| SpeakerRow {
+            id: s.id.clone().into(),
+            name: s.name.clone().into(),
+            sample: turns
+                .iter()
+                .filter(|t| t.speaker_id.as_deref() == Some(s.id.as_str()))
+                .take(2)
+                .map(|t| t.text.chars().take(140).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into(),
+        })
+        .collect::<Vec<_>>();
+    window.set_speakers(ModelRc::new(VecModel::from(rows)));
+    let names = speakers
+        .iter()
+        .map(|s| slint::SharedString::from(s.name.as_str()))
+        .collect::<Vec<_>>();
+    window.set_names(ModelRc::new(VecModel::from(names.clone())));
+    let mut assignments = vec![slint::SharedString::from("Unknown speaker")];
+    assignments.extend(names);
+    window.set_assignment_choices(ModelRc::new(VecModel::from(assignments)));
+    window.set_turn_choices(ModelRc::new(VecModel::from(
+        turns
+            .iter()
+            .map(|t| {
+                slint::SharedString::from(format!(
+                    "{}  {}: {}",
+                    recording::timestamp(t.start_ms),
+                    t.label,
+                    t.text.chars().take(60).collect::<String>()
+                ))
+            })
+            .collect::<Vec<_>>(),
+    )));
+    window.set_turn_index(
+        window
+            .get_turn_index()
+            .min(turns.len().saturating_sub(1) as i32),
+    );
+    window.set_assignment_index(window.get_assignment_index().min(speakers.len() as i32));
+    let editable = r.can_delete() && r.speaker_finished;
+    window.set_editing_enabled(editable);
+    window.set_status(if editable {"Rename a speaker to update all their turns. Merge duplicate groups or correct a turn below."} else {"Labels are provisional while recording. You can name and correct speakers after processing finishes."}.into());
+}
+fn speaker_correction(
+    ui: &MainWindow,
+    app: &Rc<RefCell<App>>,
+    change: crate::speakers::Change,
+) -> Result<()> {
+    let mut app = app.borrow_mut();
+    let previous = app
+        .selected
+        .as_ref()
+        .context("No recording selected")?
+        .clone();
+    let id = previous.id.clone();
+    let dir = app.config.transcripts_dir();
+    if let Some(p) = app.pipeline.as_ref().filter(|p| p.recording(&id).is_some()) {
+        p.correct_speaker(&id, change)?;
+    } else {
+        let mut updated = previous.clone();
+        crate::speakers::correct(&mut updated, change, &dir)?;
+        if let Some(meta) = app.library.iter_mut().find(|m| m.id == id) {
+            *meta = if updated.source.is_some() {
+                updated.metadata()
+            } else {
+                updated
+            };
+        }
+    }
+    // Keep the old source spans until selection has been mapped to the new rendering.
+    app.selected = Some(previous);
+    select(ui, &mut app, &id, false)?;
+    Ok(())
+}
+fn open_speakers(ui: &MainWindow, app: &Rc<RefCell<App>>) -> Result<()> {
+    if app.borrow().speaker_window.is_none() {
+        let window = SpeakersWindow::new()?;
+        let a = Rc::downgrade(app);
+        let w = window.as_weak();
+        let u = ui.as_weak();
+        window.on_rename_speaker(move |id, name| {
+            if let (Some(app), Some(ui), Some(window)) = (a.upgrade(), u.upgrade(), w.upgrade()) {
+                let result = speaker_correction(
+                    &ui,
+                    &app,
+                    crate::speakers::Change::Renamed {
+                        speaker_id: id.to_string(),
+                        name: name.trim().into(),
+                    },
+                );
+                window.set_error(
+                    result
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                );
+            }
+        });
+        let a = Rc::downgrade(app);
+        let w = window.as_weak();
+        let u = ui.as_weak();
+        window.on_merge_speaker(move |from, index| {
+            if let (Some(app), Some(ui), Some(window)) = (a.upgrade(), u.upgrade(), w.upgrade()) {
+                let into = app.borrow().selected.as_ref().and_then(|r| {
+                    crate::speakers::active_speakers(r)
+                        .get(index.max(0) as usize)
+                        .map(|s| s.id.clone())
+                });
+                if let Some(into) = into {
+                    let result = speaker_correction(
+                        &ui,
+                        &app,
+                        crate::speakers::Change::Merged {
+                            from: from.to_string(),
+                            into,
+                        },
+                    );
+                    window.set_error(
+                        result
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_default()
+                            .into(),
+                    );
+                }
+            }
+        });
+        let a = Rc::downgrade(app);
+        let w = window.as_weak();
+        let u = ui.as_weak();
+        window.on_reassign_turn(move |turn_index, speaker_index| {
+            if let (Some(app), Some(ui), Some(window)) = (a.upgrade(), u.upgrade(), w.upgrade()) {
+                let change = app.borrow().selected.as_ref().and_then(|r| {
+                    let turns = crate::speakers::display_turns(r);
+                    let t = turns.get(turn_index.max(0) as usize)?;
+                    let speaker_id = if speaker_index <= 0 {
+                        None
+                    } else {
+                        Some(
+                            crate::speakers::active_speakers(r)
+                                .get(speaker_index as usize - 1)?
+                                .id
+                                .clone(),
+                        )
+                    };
+                    Some(crate::speakers::Change::Reassigned(
+                        crate::speakers::Assignment {
+                            sequence: t.sequence,
+                            word_start: t.word_start,
+                            word_end: t.word_end,
+                            speaker_id,
+                        },
+                    ))
+                });
+                if let Some(change) = change {
+                    let result = speaker_correction(&ui, &app, change);
+                    window.set_error(
+                        result
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_default()
+                            .into(),
+                    );
+                }
+            }
+        });
+        app.borrow_mut().speaker_window = Some(window);
+    }
+    let app = app.borrow();
+    if let (Some(window), Some(r)) = (&app.speaker_window, &app.selected) {
+        theme(window, &app.config);
+        fill_speakers(window, r);
+        window.show()?;
+    }
+    Ok(())
+}
 fn select(ui: &MainWindow, app: &mut App, id: &str, reset: bool) -> Result<()> {
     let (r, readable) = if let Some(r) = app.pipeline.as_ref().and_then(|p| p.recording(id)) {
         (r, true)
@@ -125,6 +462,7 @@ fn select(ui: &MainWindow, app: &mut App, id: &str, reset: bool) -> Result<()> {
     };
     ui.set_can_continue(readable && r.can_continue());
     ui.set_can_delete(r.can_delete());
+    ui.set_can_edit(readable && crate::editing::available(&r));
     if !r.can_delete() {
         ui.set_delete_prompt(false);
     }
@@ -132,9 +470,69 @@ fn select(ui: &MainWindow, app: &mut App, id: &str, reset: bool) -> Result<()> {
     ui.set_selected_id(r.id.clone().into());
     ui.set_recording_title(r.title.clone().into());
     ui.set_detail(detail(&r).into());
-    ui.set_warning(r.warnings.join("\n").into());
+    let mut warnings = r.warnings.clone();
+    if !r.speaker_notice.is_empty() {
+        warnings.push(r.speaker_notice.clone());
+    }
+    ui.set_warning(warnings.join("\n").into());
+    ui.set_has_speakers(r.detect_speakers);
+    if let Some(window) = &app.speaker_window {
+        theme(window, &app.config);
+        fill_speakers(window, &r);
+        if !r.detect_speakers {
+            let _ = window.hide();
+        }
+    }
     let doc = r.text(ui.get_timed());
-    ui.invoke_replace_document(doc.into(), reset);
+    let selection = if !reset {
+        app.selected
+            .as_ref()
+            .filter(|old| old.detect_speakers && r.detect_speakers && old.id == r.id)
+            .map(|old| {
+                (
+                    crate::speakers::map_position(
+                        old,
+                        &r,
+                        ui.get_timed(),
+                        ui.get_selection_anchor().max(0) as usize,
+                    ),
+                    crate::speakers::map_position(
+                        old,
+                        &r,
+                        ui.get_timed(),
+                        ui.get_selection_cursor().max(0) as usize,
+                    ),
+                )
+            })
+    } else {
+        None
+    };
+    let old_doc = ui.get_document().to_string();
+    ui.invoke_replace_document(doc.clone().into(), reset);
+    if old_doc != doc && !reset {
+        if let Some((anchor, cursor)) = selection {
+            let boundary = |position: usize| {
+                let mut p = position.min(doc.len());
+                while !doc.is_char_boundary(p) {
+                    p -= 1;
+                }
+                p as i32
+            };
+            ui.invoke_preserve_selection(boundary(anchor), boundary(cursor));
+        }
+        let matches = find_matches(&doc, ui.get_query().as_str());
+        app.search_cursor = app.search_cursor.min(matches.len().saturating_sub(1));
+        ui.set_matches(
+            if ui.get_query().is_empty() {
+                String::new()
+            } else if matches.is_empty() {
+                "0 matches".into()
+            } else {
+                format!("{} / {}", app.search_cursor + 1, matches.len())
+            }
+            .into(),
+        );
+    }
     if reset {
         ui.set_delete_prompt(false);
         ui.set_query("".into());
@@ -158,6 +556,12 @@ fn forget_recording(ui: &MainWindow, app: &mut App, id: &str) {
     app.library.retain(|r| r.id != id);
     if ui.get_selected_id().as_str() == id {
         app.selected = None;
+        if let Some(window) = &app.speaker_window {
+            window.set_editing_enabled(false);
+            window.set_speakers(ModelRc::new(VecModel::from(Vec::<SpeakerRow>::new())));
+            window.set_error("".into());
+            let _ = window.hide();
+        }
         app.search_query.clear();
         app.search_cursor = 0;
         ui.set_selected_id("".into());
@@ -166,7 +570,9 @@ fn forget_recording(ui: &MainWindow, app: &mut App, id: &str) {
         ui.set_warning("".into());
         ui.set_live_draft("".into());
         ui.set_can_continue(false);
+        ui.set_has_speakers(false);
         ui.set_can_delete(false);
+        ui.set_can_edit(false);
         ui.set_legacy_recording(false);
         ui.set_delete_prompt(false);
         ui.set_query("".into());
@@ -184,6 +590,15 @@ fn forget_recording(ui: &MainWindow, app: &mut App, id: &str) {
     fill_library(ui, app);
 }
 fn begin_quit(ui: &MainWindow, app: &mut App, confirmed: bool) {
+    if let Some(editor) = &app.editor {
+        if editor.window.get_dirty() {
+            editor
+                .window
+                .set_error("Save or discard your transcript edits before quitting.".into());
+            let _ = editor.window.show();
+            return;
+        }
+    }
     let unsaved = app
         .pipeline
         .as_ref()
@@ -200,6 +615,100 @@ fn begin_quit(ui: &MainWindow, app: &mut App, confirmed: bool) {
     } else {
         let _ = slint::quit_event_loop();
     }
+}
+fn model_ids() -> Vec<String> {
+    ["recommended".into(), "custom".into()]
+        .into_iter()
+        .chain(crate::models::catalog().iter().map(|m| m.id.clone()))
+        .collect()
+}
+fn model_list(s: &SettingsWindow, app: &App) {
+    let mut names = vec![
+        "Recommended for this device".into(),
+        "Custom checkpoint (Advanced)".into(),
+    ];
+    names.extend(crate::models::catalog().iter().map(|m| {
+        format!(
+            "{} · {} · {:.0} MiB",
+            m.name,
+            if crate::models::installed(&app.config, m).is_some() {
+                "Installed"
+            } else {
+                "Download"
+            },
+            m.size as f64 / 1048576.0
+        )
+        .into()
+    }));
+    s.set_asr_models(ModelRc::new(VecModel::from(names)));
+    s.set_asr_model_ids(ModelRc::new(VecModel::from(
+        model_ids()
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
+    s.set_gpu_status(
+        app.gpu
+            .device
+            .as_ref()
+            .map(|g| g.label())
+            .unwrap_or_else(|| app.gpu.reason.clone())
+            .into(),
+    );
+}
+fn model_details(s: &SettingsWindow, app: &App) {
+    let ids = model_ids();
+    let id = ids
+        .get(s.get_asr_model().max(0) as usize)
+        .map(String::as_str)
+        .unwrap_or("recommended");
+    let text = match id {
+        "custom" => format!(
+            "Uses the whisper_model path in Advanced: {}",
+            app.config.whisper_model.display()
+        ),
+        "recommended" => {
+            let mut config = app.config.clone();
+            config.indonesian_processing = match s.get_processing() {
+                1 => crate::config::Processing::Nvidia,
+                2 => crate::config::Processing::Cpu,
+                _ => crate::config::Processing::Auto,
+            };
+            if crate::models::gpu_recommended(
+                config.indonesian_processing,
+                app.gpu.device.as_ref(),
+                crate::models::cuda_runtime_exists(&config),
+            ) {
+                if crate::models::qualified(&config, app.gpu.device.as_ref()) {
+                    "Uses turbo when installed. Otherwise uses Indonesian Whisper small.".into()
+                } else {
+                    "Indonesian Whisper small is active until turbo passes a speed check. Download turbo, select it, save, and record at least 30 seconds to qualify this device.".into()
+                }
+            } else {
+                "Uses Indonesian Whisper small. Lowercase output without punctuation.".into()
+            }
+        }
+        id => crate::models::get(id)
+            .map(|m| {
+                format!(
+                    "{} {:.0} MiB. {}. {}",
+                    m.description,
+                    m.size as f64 / 1048576.0,
+                    m.license,
+                    m.source
+                )
+            })
+            .unwrap_or_default(),
+    };
+    s.set_model_details(text.into());
+}
+fn advanced_config(raw: &str) -> Result<Config> {
+    let mut value: toml::Value = toml::from_str(raw)?;
+    if let Some(table) = value.as_table_mut() {
+        table.remove("indonesian_processing");
+        table.remove("indonesian_model");
+    }
+    Ok(value.try_into()?)
 }
 fn settings_values(s: &SettingsWindow, app: &App) {
     let c = &app.config;
@@ -228,12 +737,26 @@ fn settings_values(s: &SettingsWindow, app: &App) {
     s.set_output_devices(ModelRc::new(VecModel::from(names)));
     s.set_output_device_ids(ModelRc::new(VecModel::from(ids)));
     s.set_language(if c.language == Language::En { 0 } else { 1 });
+    s.set_processing(match c.indonesian_processing {
+        crate::config::Processing::Auto => 0,
+        crate::config::Processing::Nvidia => 1,
+        crate::config::Processing::Cpu => 2,
+    });
+    model_list(s, app);
+    let ids = model_ids();
+    s.set_asr_model(
+        ids.iter()
+            .position(|id| id == c.indonesian_model.as_str())
+            .unwrap_or(1) as i32,
+    );
+    model_details(s, app);
     s.set_theme(match c.viewer_theme {
         ViewerTheme::System => 0,
         ViewerTheme::Light => 1,
         ViewerTheme::Dark => 2,
     });
     s.set_autosave(c.save_transcript);
+    s.set_detect_speakers(c.detect_speakers);
     s.set_startup(c.start_listening);
     s.set_overlay(c.show_indicator);
     s.set_notifications(c.show_result_popup);
@@ -257,8 +780,11 @@ fn settings_values(s: &SettingsWindow, app: &App) {
     let mut value = toml::Value::try_from(c).expect("serialize settings");
     for key in [
         "language",
+        "indonesian_processing",
+        "indonesian_model",
         "audio_output_device",
         "save_transcript",
+        "detect_speakers",
         "start_listening",
         "show_indicator",
         "show_result_popup",
@@ -376,10 +902,25 @@ pub fn run(
     });
     let app = Rc::new(RefCell::new(App {
         config,
+        downloads: crate::models::Downloads::default(),
+        downloaded: None,
+        gpu: crate::gpu::Discovery {
+            device: None,
+            reason: "Checking NVIDIA availability…".into(),
+        },
+        gpu_rx: {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::gpu::discover());
+            });
+            rx
+        },
         pipeline,
         keys,
         library,
         selected: None,
+        speaker_window: None,
+        editor: None,
         quitting: false,
         started: None,
         started_duration_ms: 0,
@@ -623,6 +1164,28 @@ pub fn run(
     {
         let weak = ui.as_weak();
         let app = app.clone();
+        ui.on_edit_transcript(move || {
+            if let Some(ui) = weak.upgrade() {
+                if let Err(e) = open_editor(&ui, &app) {
+                    ui.set_warning(e.to_string().into());
+                }
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let app = app.clone();
+        ui.on_manage_speakers(move || {
+            if let Some(ui) = weak.upgrade() {
+                if let Err(e) = open_speakers(&ui, &app) {
+                    ui.set_warning(e.to_string().into());
+                }
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let app = app.clone();
         ui.on_rename_recording(move |title| {
             if let Some(ui) = weak.upgrade() {
                 let mut app = app.borrow_mut();
@@ -722,6 +1285,9 @@ pub fn run(
                 (weak.upgrade(), sw.upgrade(), ow.upgrade(), nw.upgrade())
             {
                 sync_theme(&ui, &s, &o, &n, &app.config);
+                if let Some(window) = &app.speaker_window {
+                    theme(window, &app.config);
+                }
             }
         });
     }
@@ -734,8 +1300,25 @@ pub fn run(
             if let Some(s) = sw.upgrade() {
                 let result = (|| -> Result<()> {
                     let mut app = app.borrow_mut();
-                    let mut next: Config = toml::from_str(s.get_advanced().as_str())?;
+                    let mut next = advanced_config(s.get_advanced().as_str())?;
                     next.base_dir = app.config.base_dir.clone();
+                    next.indonesian_processing = match s.get_processing() {
+                        1 => crate::config::Processing::Nvidia,
+                        2 => crate::config::Processing::Cpu,
+                        _ => crate::config::Processing::Auto,
+                    };
+                    next.indonesian_model = model_ids()
+                        .get(s.get_asr_model().max(0) as usize)
+                        .cloned()
+                        .unwrap_or_else(|| "recommended".into())
+                        .parse()?;
+                    if !matches!(next.indonesian_model.as_str(), "recommended" | "custom") {
+                        let m = crate::models::get(next.indonesian_model.as_str())?;
+                        anyhow::ensure!(
+                            crate::models::installed(&next, m).is_some(),
+                            "Download the selected model before saving."
+                        );
+                    }
                     next.language = if s.get_language() == 0 {
                         Language::En
                     } else {
@@ -756,6 +1339,7 @@ pub fn run(
                         _ => ViewerTheme::System,
                     };
                     next.save_transcript = s.get_autosave();
+                    next.detect_speakers = s.get_detect_speakers();
                     next.start_listening = s.get_startup();
                     next.show_indicator = s.get_overlay();
                     next.show_result_popup = s.get_notifications();
@@ -867,6 +1451,116 @@ pub fn run(
             });
         }
     }));
+    {
+        let app = app.clone();
+        let sw = settings.as_weak();
+        settings.on_model_selected(move || {
+            if let Some(s) = sw.upgrade() {
+                model_details(&s, &app.borrow());
+            }
+        });
+    }
+    for recommended in [false, true] {
+        let app = app.clone();
+        let sw = settings.as_weak();
+        let callback = move || {
+            if let Some(s) = sw.upgrade() {
+                let mut app = app.borrow_mut();
+                let id = if recommended {
+                    if s.get_processing() != 2
+                        && crate::models::gpu_recommended(
+                            crate::config::Processing::Auto,
+                            app.gpu.device.as_ref(),
+                            crate::models::cuda_runtime_exists(&app.config),
+                        )
+                    {
+                        "turbo".to_string()
+                    } else {
+                        "small-id".to_string()
+                    }
+                } else {
+                    model_ids()
+                        .get(s.get_asr_model().max(0) as usize)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let id = if id == "recommended" {
+                    if s.get_processing() != 2
+                        && crate::models::gpu_recommended(
+                            crate::config::Processing::Auto,
+                            app.gpu.device.as_ref(),
+                            crate::models::cuda_runtime_exists(&app.config),
+                        )
+                    {
+                        "turbo".into()
+                    } else {
+                        "small-id".into()
+                    }
+                } else {
+                    id
+                };
+                let config = app.config.clone();
+                if let Ok(model) = crate::models::get(&id)
+                    && crate::models::installed(&config, model).is_some()
+                {
+                    app.downloaded = Some(id);
+                    s.set_can_use_downloaded(true);
+                    s.set_download_status("This model is already installed. Use downloaded model, then save settings to select it.".into());
+                    return;
+                }
+                match app.downloads.start(&config, &id) {
+                    Ok(()) => {
+                        app.downloaded = None;
+                        s.set_downloading(true);
+                        s.set_can_use_downloaded(false);
+                        s.set_download_status("Connecting…".into());
+                    }
+                    Err(e) => s.set_download_status(e.to_string().into()),
+                }
+            }
+        };
+        if recommended {
+            settings.on_download_recommended(callback);
+        } else {
+            settings.on_download_model(callback);
+        }
+    }
+    {
+        let app = app.clone();
+        settings.on_cancel_download(move || app.borrow().downloads.cancel());
+    }
+    {
+        let app = app.clone();
+        let sw = settings.as_weak();
+        settings.on_use_downloaded(move || {
+            if let Some(s) = sw.upgrade()
+                && let Some(id) = app.borrow().downloaded.as_ref()
+            {
+                if let Some(index) = model_ids().iter().position(|m| m == id) {
+                    s.set_asr_model(index as i32);
+                    model_details(&s, &app.borrow());
+                }
+            }
+        });
+    }
+    let download_timer = Timer::default();
+    {
+        let app = app.clone();
+        let sw = settings.as_weak();
+        download_timer.start(TimerMode::Repeated,Duration::from_millis(100),move|| {
+            let Some(s)=sw.upgrade() else{return;};let mut app=app.borrow_mut();
+            if let Ok(gpu)=app.gpu_rx.try_recv(){app.gpu=gpu;model_list(&s,&app);model_details(&s,&app);}
+            for event in app.downloads.events.try_iter().collect::<Vec<_>>() {
+                match event {
+                    crate::models::DownloadEvent::Progress{id,bytes,total} => s.set_download_status(format!("Downloading {}: {:.0}% ({:.0}/{:.0} MiB)",id,100.0*bytes as f64/total as f64,bytes as f64/1048576.0,total as f64/1048576.0).into()),
+                    crate::models::DownloadEvent::Complete(id)=>{app.downloads.finish();app.downloaded=Some(id);s.set_downloading(false);s.set_can_use_downloaded(true);s.set_download_status("Download verified. Use downloaded model, then save settings to apply it to the next recording.".into());model_list(&s,&app);},
+                    crate::models::DownloadEvent::Failed{id,error}=>{app.downloads.finish();s.set_downloading(false);s.set_download_status(format!("{id}: {error}. Select Download to retry.").into());},
+                }
+            }
+            let status=app.pipeline.as_ref().map(|p|p.live_state()).map(|v|v.inference).unwrap_or_default();
+            s.set_inference_status(if status.is_empty(){"Inference starts with the next recording".into()}else{format!("Active: {status}").into()});
+        });
+    }
     let timer = Timer::default();
     let weak = ui.as_weak();
     let sw = settings.as_weak();
@@ -1060,6 +1754,9 @@ pub fn run(
             app.notification_until = None;
         }
         sync_theme(&ui, &s, &o, &n, &app.config);
+        if let Some(window) = &app.speaker_window {
+            theme(window, &app.config);
+        }
         if app.quitting && !recording && !finishing {
             if let Some(k) = app.keys.as_mut() {
                 k.shutdown();
@@ -1109,6 +1806,23 @@ fn find_matches(text: &str, query: &str) -> Vec<(usize, usize)> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advanced_toml_cannot_replace_model_controls() {
+        let config = super::advanced_config("indonesian_model = 'accidental-invalid-value'\nindonesian_processing = 'invalid'\nwhisper_model = 'my-custom.bin'").unwrap();
+        assert_eq!(
+            config.indonesian_model,
+            crate::config::ModelSelection::Recommended
+        );
+        assert_eq!(
+            config.indonesian_processing,
+            crate::config::Processing::Auto
+        );
+        assert_eq!(
+            config.whisper_model,
+            std::path::PathBuf::from("my-custom.bin")
+        );
+    }
+
     use super::*;
     #[test]
     fn unicode_search_offsets() {
@@ -1250,11 +1964,17 @@ mod deletion_tests {
         ui.window().set_size(slint::LogicalSize::new(1180., 780.));
         ui.show().unwrap();
         let app = App {
+            downloads: crate::models::Downloads::default(),
+            downloaded: None,
+            gpu: crate::gpu::Discovery::default(),
+            gpu_rx: crossbeam_channel::bounded(1).1,
             config: Config::default(),
             pipeline: None,
             keys: None,
             library: records,
             selected: None,
+            speaker_window: None,
+            editor: None,
             quitting: false,
             started: None,
             started_duration_ms: 0,
@@ -1275,6 +1995,198 @@ mod deletion_tests {
         let mut r = Recording::new(Language::En, false);
         r.status = RecordingStatus::Completed;
         r
+    }
+    #[test]
+    fn edit_action_remains_visible_with_compact_library() {
+        let mut r = completed();
+        r.title = "A long recording title that should shrink before the action buttons".into();
+        r.segments.push(TranscriptSegment {
+            recording_id: r.id.clone(),
+            sequence: 0,
+            start_ms: 0,
+            end_ms: 1000,
+            text: "Editable.".into(),
+            clock_time: None,
+        });
+        let id = r.id.clone();
+        let (ui, mut app) = fixture(vec![r]);
+        select(&ui, &mut app, &id, true).unwrap();
+        ui.window().set_size(slint::LogicalSize::new(800., 600.));
+        ui.set_compact(true);
+        ui.set_sidebar_open(true);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+        let action = ElementHandle::find_by_accessible_label(&ui, "Edit transcript")
+            .next()
+            .unwrap();
+        assert!(
+            action.absolute_position().x + action.size().width <= 800.,
+            "Edit action exceeds window: {:?} {:?}",
+            action.absolute_position(),
+            action.size()
+        );
+        assert!(action.absolute_position().y + action.size().height <= 600.);
+    }
+    #[test]
+    fn transcript_editor_saves_search_export_and_reload_and_confirms_discard() {
+        let (ui, app) = fixture(vec![]);
+        let app = Rc::new(RefCell::new(app));
+        let root = std::env::temp_dir().join(format!("edit-ui-{}", completed().id));
+        app.borrow_mut().config.base_dir = root.clone();
+        for saved in [false, true] {
+            let mut r = completed();
+            r.autosave = saved;
+            r.exported = true;
+            r.segments.push(TranscriptSegment {
+                recording_id: r.id.clone(),
+                sequence: 0,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "Original words.".into(),
+                clock_time: None,
+            });
+            if saved {
+                let mut store =
+                    recording::RecordingStore::new(app.borrow().config.transcripts_dir());
+                store.begin(&mut r).unwrap();
+                store
+                    .append(&PipelineEvent::Segment(r.segments[0].clone()))
+                    .unwrap();
+                store
+                    .append(&PipelineEvent::State {
+                        id: r.id.clone(),
+                        status: r.status.clone(),
+                        duration_ms: 1000,
+                    })
+                    .unwrap();
+            }
+            let id = r.id.clone();
+            app.borrow_mut().library = vec![r];
+            select(&ui, &mut app.borrow_mut(), &id, true).unwrap();
+            assert!(ui.get_can_edit());
+            open_editor(&ui, &app).unwrap();
+            let window = app.borrow().editor.as_ref().unwrap().window.clone_strong();
+            ElementHandle::find_by_accessible_label(&window, "Transcript passage [00:00:00]")
+                .next()
+                .unwrap()
+                .set_accessible_value("Edited café 😊.");
+            assert!(window.get_dirty());
+            assert_eq!(
+                window.get_passages().row_data(0).unwrap().text.as_str(),
+                "Edited café 😊."
+            );
+            window.invoke_cancel();
+            assert!(window.get_discard_prompt());
+            window.set_discard_prompt(false);
+            ui.set_query("café".into());
+            window.invoke_save();
+            assert!(window.get_error().is_empty(), "{}", window.get_error());
+            assert!(!window.get_dirty());
+            assert_eq!(ui.get_document().as_str(), "Edited café 😊.");
+            assert_eq!(ui.get_matches().as_str(), "1 / 1");
+            let full = app.borrow().selected.clone().unwrap();
+            assert!(!full.exported);
+            assert!(full.markdown().contains("Edited café 😊."));
+            assert_eq!(
+                recording::load_recording(&full).unwrap().text(false),
+                "Edited café 😊."
+            );
+            open_editor(&ui, &app).unwrap();
+            window.get_passages().set_row_data(
+                0,
+                EditorRow {
+                    label: "[00:00:00]".into(),
+                    text: "Discarded.".into(),
+                },
+            );
+            window.set_dirty(true);
+            begin_quit(&ui, &mut app.borrow_mut(), true);
+            assert!(!app.borrow().quitting);
+            assert!(window.get_error().contains("before quitting"));
+            window.invoke_discard();
+            assert!(!window.get_dirty());
+            assert_eq!(ui.get_document().as_str(), "Edited café 😊.");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn speaker_controls_update_selection_find_and_survive_saved_reload() {
+        use crate::speakers::{Speaker, SpeakerTurn};
+        let (ui, app) = fixture(vec![]);
+        let app = Rc::new(RefCell::new(app));
+        let root = std::env::temp_dir().join(format!("speaker-ui-{}", completed().id));
+        app.borrow_mut().config.base_dir = root.clone();
+        app.borrow_mut().config.viewer_theme = ViewerTheme::Dark;
+        for saved in [false, true] {
+            let mut r = completed();
+            r.autosave = saved;
+            r.detect_speakers = true;
+            r.speaker_finished = true;
+            r.speakers = ["1", "2"]
+                .iter()
+                .map(|id| Speaker {
+                    id: id.to_string(),
+                    name: format!("Speaker {id}"),
+                    embedding: vec![1., 0.],
+                    observations: 1,
+                    merged_into: None,
+                })
+                .collect();
+            r.segments.push(TranscriptSegment {
+                recording_id: r.id.clone(),
+                sequence: 0,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "Hello reader".into(),
+                clock_time: None,
+            });
+            r.speaker_turns.push(SpeakerTurn {
+                start_ms: 0,
+                end_ms: 1000,
+                speaker_id: Some("1".into()),
+            });
+            if saved {
+                let mut store =
+                    recording::RecordingStore::new(app.borrow().config.transcripts_dir());
+                store.begin(&mut r).unwrap();
+                store
+                    .append(&PipelineEvent::Segment(r.segments[0].clone()))
+                    .unwrap();
+            }
+            let id = r.id.clone();
+            app.borrow_mut().library = vec![r.clone()];
+            select(&ui, &mut app.borrow_mut(), &id, true).unwrap();
+            open_speakers(&ui, &app).unwrap();
+            let window = app.borrow().speaker_window.as_ref().unwrap().clone_strong();
+            assert!(window.global::<Theme>().get_dark());
+            ui.set_query("Sarah".into());
+            let old = ui.get_document().to_string();
+            let at = old.find("Hello").unwrap();
+            ui.invoke_preserve_selection(at as i32, (at + 5) as i32);
+            window.invoke_rename_speaker("1".into(), "Sarah".into());
+            assert!(window.get_error().is_empty(), "{}", window.get_error());
+            assert_eq!(ui.get_document().as_str(), "Sarah: Hello reader");
+            assert_eq!(ui.get_matches().as_str(), "1 / 1");
+            assert_eq!(ui.get_selection_anchor(), 7);
+            assert_eq!(ui.get_selection_cursor(), 12);
+            window.invoke_reassign_turn(0, 2);
+            assert_eq!(ui.get_document().as_str(), "Speaker 2: Hello reader");
+            window.invoke_merge_speaker("2".into(), 0);
+            assert_eq!(ui.get_document().as_str(), "Sarah: Hello reader");
+            assert_eq!(window.get_speakers().row_count(), 1);
+            let full = app.borrow().selected.as_ref().unwrap().clone();
+            let restored = recording::load_recording(&full).unwrap();
+            assert_eq!(restored.text(false), "Sarah: Hello reader");
+            assert!(
+                restored
+                    .speakers
+                    .iter()
+                    .any(|s| s.id == "2" && s.merged_into.as_deref() == Some("1"))
+            );
+            assert_eq!(restored.speaker_overrides.len(), 1);
+            forget_recording(&ui, &mut app.borrow_mut(), &id);
+            assert!(!window.get_editing_enabled());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn delete_requires_confirmation_and_cancel_does_not_delete() {
@@ -1312,7 +2224,10 @@ mod deletion_tests {
             let element = ElementHandle::find_by_accessible_label(&ui, label)
                 .next()
                 .unwrap();
-            assert!(element.absolute_position().y + element.size().height <= 600., "{label} is below the window");
+            assert!(
+                element.absolute_position().y + element.size().height <= 600.,
+                "{label} is below the window"
+            );
         }
     }
     #[test]

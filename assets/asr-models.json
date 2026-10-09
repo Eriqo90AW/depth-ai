@@ -1,0 +1,86 @@
+[
+  {
+    "id": "base",
+    "name": "Whisper base",
+    "filename": "ggml-base-q5_1.bin",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base-q5_1.bin",
+    "sha256": "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
+    "size": 59707625,
+    "description": "Multilingual recognition with casing and punctuation.",
+    "license": "MIT",
+    "source": "https://huggingface.co/ggerganov/whisper.cpp"
+  },
+  {
+    "id": "small",
+    "name": "Whisper small",
+    "filename": "ggml-small-q5_1.bin",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
+    "sha256": "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+    "size": 190085487,
+    "description": "Multilingual recognition with casing and punctuation.",
+    "license": "MIT",
+    "source": "https://huggingface.co/ggerganov/whisper.cpp"
+  },
+  {
+    "id": "medium",
+    "name": "Whisper medium",
+    "filename": "ggml-medium-q5_0.bin",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-medium-q5_0.bin",
+    "sha256": "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
+    "size": 539212467,
+    "description": "Multilingual recognition with casing and punctuation.",
+    "license": "MIT",
+    "source": "https://huggingface.co/ggerganov/whisper.cpp"
+  },
+  {
+    "id": "turbo",
+    "name": "Whisper large-v3-turbo",
+    "filename": "ggml-large-v3-turbo-q5_0.bin",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
+    "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+    "size": 574041195,
+    "description": "Multilingual recognition with casing and punctuation.",
+    "license": "MIT",
+    "source": "https://huggingface.co/ggerganov/whisper.cpp"
+  },
+  {
+    "id": "large-v3",
+    "name": "Whisper large-v3",
+    "filename": "ggml-large-v3-q5_0.bin",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-q5_0.bin",
+    "sha256": "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1",
+    "size": 1081140203,
+    "description": "Multilingual recognition with casing and punctuation.",
+    "license": "MIT",
+    "source": "https://huggingface.co/ggerganov/whisper.cpp"
+  },
+  {
+    "id": "small-id",
+    "name": "Indonesian Whisper small",
+    "filename": "ggml-small-id-q8_0.bin",
+    "revision": "37a5b9a0fa5739e8e859984dabca44337a45fa55",
+    "url": "https://huggingface.co/maleo-ai/whisper-small-id/resolve/37a5b9a0fa5739e8e859984dabca44337a45fa55/ggml-small-id-q8_0.bin",
+    "sha256": "4f976a9aeae18e30d2043887302fe35ba45e8f8cb0a9f9f727d56d32cdef33c9",
+    "size": 264464624,
+    "description": "Lowercase output without punctuation.",
+    "license": "Apache-2.0",
+    "source": "https://huggingface.co/maleo-ai/whisper-small-id"
+  },
+  {
+    "id": "medium-id",
+    "name": "Indonesian Whisper medium",
+    "filename": "ggml-model-medium-id-q5_0.bin",
+    "revision": "674030cf4477a23e279fbc95ffa993b08db02269",
+    "url": "https://huggingface.co/rafdiraf/whisper-medium-id-ggml/resolve/674030cf4477a23e279fbc95ffa993b08db02269/ggml-model-medium-id-q5_0.bin",
+    "sha256": "da09c51f05f78a727d37325e2d1ad7b78c20597593215276e820cd7fa1e92e0f",
+    "size": 539212467,
+    "description": "Fine-tuned for Indonesian; casing and punctuation.",
+    "license": "Apache-2.0",
+    "source": "https://huggingface.co/rafdiraf/whisper-medium-id-ggml"
+  }
+]

@@ -1,0 +1,8 @@
+Speaker detection uses Sherpa-ONNX 1.13.8 and ONNX Runtime.
+Pyannote segmentation-3.0 was converted/quantized to ONNX by Sherpa-ONNX.
+TitaNet Small by NVIDIA was converted to ONNX by Sherpa-ONNX.
+The NVIDIA NGC titanet_small model card licenses this model under the NeMo toolkit license.
+Model card: https://api.ngc.nvidia.com/v2/models/nvidia/nemo/titanet_small
+Segmentation: https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-segmentation-models
+Embeddings: https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models
+See the bundled upstream LICENSE files. No model training was performed by Depth.

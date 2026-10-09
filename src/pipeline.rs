@@ -51,6 +51,16 @@ pub enum Control {
     SetLanguage(Language),
     SetSaveEnabled(bool),
     Configure(Box<Config>),
+    CorrectTranscript {
+        id: String,
+        request: crate::editing::Request,
+        result: Sender<std::io::Result<()>>,
+    },
+    CorrectSpeaker {
+        id: String,
+        change: crate::speakers::Change,
+        result: Sender<std::io::Result<()>>,
+    },
     Shutdown,
 }
 pub struct PipelineHandle {
@@ -193,6 +203,38 @@ impl PipelineHandle {
         }
         Err(std::io::Error::other("Recording not found"))
     }
+    pub fn correct_speaker(
+        &self,
+        id: &str,
+        change: crate::speakers::Change,
+    ) -> std::io::Result<()> {
+        let (tx, rx) = bounded(1);
+        self.control
+            .send(Control::CorrectSpeaker {
+                id: id.into(),
+                change,
+                result: tx,
+            })
+            .map_err(|_| std::io::Error::other("Recording controller stopped"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("Recording controller stopped"))?
+    }
+    pub fn correct_transcript(
+        &self,
+        id: &str,
+        request: crate::editing::Request,
+    ) -> std::io::Result<()> {
+        let (tx, rx) = bounded(1);
+        self.control
+            .send(Control::CorrectTranscript {
+                id: id.into(),
+                request,
+                result: tx,
+            })
+            .map_err(|_| std::io::Error::other("Recording controller stopped"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("Recording controller stopped"))?
+    }
     pub fn shutdown(mut self) {
         self.request_stop();
         for t in self.threads.drain(..) {
@@ -287,6 +329,7 @@ fn prepare_recording(
         return Ok((recording, store));
     }
     let mut recording = Recording::new(config.language, config.save_transcript);
+    recording.detect_speakers = config.detect_speakers;
     if let Err(e) = store.begin(&mut recording) {
         recording.autosave = false;
         recording.warnings.push(format!(
@@ -312,6 +355,7 @@ fn controller(
     let mut deleted = std::collections::HashSet::new();
     let mut engine = None;
     let mut engine_language = config.language;
+    let mut engine_word_timestamps = config.word_timestamps || config.detect_speakers;
     let mut engine_dirty = false;
     let mut idle = Instant::now();
     let initial = config.start_listening;
@@ -333,7 +377,10 @@ fn controller(
                 Control::Delete(requested) => {
                     // Completion status is published before the final save returns.
                     // Keep this recording protected until its worker has been joined.
-                    if active.as_ref().is_some_and(|a| lock(&a.recording).id == requested.id) {
+                    if active
+                        .as_ref()
+                        .is_some_and(|a| lock(&a.recording).id == requested.id)
+                    {
                         let _ = events.send(PipelineEvent::Warning {
                             id: requested.id.clone(),
                             message: "Could not delete recording: wait for transcription and saving to finish.".into(),
@@ -361,6 +408,82 @@ fn controller(
                             let _ = events.send(PipelineEvent::Warning { id, message });
                         }
                     }
+                }
+                Control::CorrectSpeaker { id, change, result } => {
+                    let outcome = if active.as_ref().is_some_and(|a| lock(&a.recording).id == id) {
+                        Err(std::io::Error::other(
+                            "Wait for transcription and speaker detection to finish.",
+                        ))
+                    } else {
+                        let existing = lock(&records).iter().find(|r| lock(r).id == id).cloned();
+                        if let Some(existing) = existing {
+                            let mut r = lock(&existing);
+                            let loaded = if r.segments.is_empty() && r.source.is_some() {
+                                crate::recording::load_recording(&r)
+                            } else {
+                                Ok(r.clone())
+                            };
+                            loaded.and_then(|mut full| {
+                                let outcome = crate::speakers::correct(
+                                    &mut full,
+                                    change.clone(),
+                                    &config.transcripts_dir(),
+                                );
+                                *r = if full.autosave && full.source.is_some() {
+                                    full.metadata()
+                                } else {
+                                    full
+                                };
+                                outcome
+                            })
+                        } else {
+                            Err(std::io::Error::other("Recording not found"))
+                        }
+                    };
+                    if outcome.is_ok() {
+                        let _ = events.send(PipelineEvent::Speaker { id, change });
+                    }
+                    let _ = result.send(outcome);
+                }
+                Control::CorrectTranscript {
+                    id,
+                    request,
+                    result,
+                } => {
+                    let outcome = if active.as_ref().is_some_and(|a| lock(&a.recording).id == id) {
+                        Err(std::io::Error::other(
+                            "Wait for transcription and speaker detection to finish.",
+                        ))
+                    } else {
+                        let existing = lock(&records).iter().find(|r| lock(r).id == id).cloned();
+                        if let Some(existing) = existing {
+                            let mut r = lock(&existing);
+                            let loaded = if r.segments.is_empty() && r.source.is_some() {
+                                crate::recording::load_recording(&r)
+                            } else {
+                                Ok(r.clone())
+                            };
+                            loaded.and_then(|mut full| {
+                                let outcome = crate::editing::correct(
+                                    &mut full,
+                                    request.clone(),
+                                    &config.transcripts_dir(),
+                                );
+                                *r = if full.autosave && full.source.is_some() {
+                                    full.metadata()
+                                } else {
+                                    full
+                                };
+                                outcome
+                            })
+                        } else {
+                            Err(std::io::Error::other("Recording not found"))
+                        }
+                    };
+                    if outcome.is_ok() {
+                        let _ = events.send(PipelineEvent::TranscriptUpdated { id });
+                    }
+                    let _ = result.send(outcome);
                 }
                 Control::Configure(c) => {
                     config = *c;
@@ -406,6 +529,8 @@ fn controller(
                         let duration_before_ms = recording.duration_ms;
                         let mut session_config = config.clone();
                         session_config.language = recording.language;
+                        session_config.detect_speakers = recording.detect_speakers;
+                        session_config.word_timestamps |= recording.detect_speakers;
                         let started_recording = recording.metadata();
                         lock(&live).begin(recording.id.clone());
                         logger.info(format!(
@@ -429,10 +554,14 @@ fn controller(
                         paused.store(false, Ordering::Release);
                         *lock(&status) = Status::Listening;
                         let _ = events.send(PipelineEvent::Started(started_recording));
-                        if engine_dirty || engine_language != session_config.language {
+                        if engine_dirty
+                            || engine_language != session_config.language
+                            || engine_word_timestamps != session_config.word_timestamps
+                        {
                             engine = None;
                         }
                         engine_language = session_config.language;
+                        engine_word_timestamps = session_config.word_timestamps;
                         engine_dirty = false;
                         let stop = Arc::new(AtomicBool::new(false));
                         let started = Instant::now();
@@ -553,7 +682,9 @@ fn transcribe_recording(
         last_text,
         live,
         engine,
-        move |config, stop, logger| capture_recording(config, stop, logger, capture_live),
+        move |config, stop, logger, speakers| {
+            capture_recording(config, stop, logger, capture_live, speakers)
+        },
     )
 }
 fn capture_recording(
@@ -561,6 +692,7 @@ fn capture_recording(
     stop: Arc<AtomicBool>,
     logger: Arc<Logger>,
     live: Arc<Mutex<LiveState>>,
+    speaker_input: Option<crate::speakers::worker::WindowInput>,
 ) -> (Receiver<Segment>, Receiver<String>, JoinHandle<()>) {
     let (tx, rx) = bounded::<Segment>(config.queue_capacity);
     let (warnings_tx, warnings_rx) = unbounded::<String>();
@@ -568,6 +700,8 @@ fn capture_recording(
     let cfg = config.clone();
     let log = logger.clone();
     let capture_thread = std::thread::spawn(move || {
+        let speaker_input = Arc::new(Mutex::new(speaker_input));
+        let speaker_sink = speaker_input.clone();
         let segmenter = Arc::new(Mutex::new(Segmenter::new(segmenter_config(&cfg))));
         let gate = segmenter.clone();
         let queue = tx.clone();
@@ -589,6 +723,9 @@ fn capture_recording(
         let mut revision = 0u64;
         let mut was_speech = false;
         let sink = Box::new(move |audio: &[f32], start_ms: u64| {
+            if let Some(input) = lock(&speaker_sink).as_mut() {
+                input.push(audio, start_ms);
+            }
             let mut segmenter = lock(&gate);
             let segments = segmenter.push_at(audio, start_ms * capture::TARGET_RATE as u64 / 1000);
             let in_speech = segmenter.in_speech();
@@ -632,11 +769,7 @@ fn capture_recording(
         let health_live = live.clone();
         let observer = Box::new(move |update| {
             let mut state = lock(&health_live);
-            match update {
-                capture::CaptureUpdate::Source(device) => state.source = device.name,
-                capture::CaptureUpdate::Level { packets, peak_db } => state.level(packets, peak_db),
-                capture::CaptureUpdate::Notice(message) => state.capture_notice = message,
-            }
+            state.capture_update(update);
         });
         if let Err(e) = capture::run_timed_selected(
             sink,
@@ -652,6 +785,12 @@ fn capture_recording(
         // Flush is blocking here: Stop must keep the final utterance even when the queue is full.
         if let Some(segment) = lock(&segmenter).flush() {
             let _ = tx.send(segment);
+        }
+        if let Some(input) = lock(&speaker_input).take() {
+            let skipped = input.finish();
+            if skipped > 0 {
+                log.warn(format!("speaker analysis skipped {skipped} windows under queue pressure; transcription preserved"));
+            }
         }
         preview_stop.store(true, Ordering::Release);
         if let Some(thread) = preview_thread {
@@ -738,6 +877,66 @@ fn spawn_preview(
         None
     }
 }
+fn publish_speaker(
+    change: crate::speakers::Change,
+    recording: &Arc<Mutex<Recording>>,
+    store: &mut RecordingStore,
+    events: &Sender<PipelineEvent>,
+    logger: &Logger,
+) {
+    let mut r = lock(recording);
+    if let crate::speakers::Change::Profile(profile) = &change {
+        if r.speakers.iter().any(|s| {
+            s.id == profile.id
+                && s.embedding == profile.embedding
+                && s.observations == profile.observations
+        }) {
+            return;
+        }
+    }
+    let event = PipelineEvent::Speaker {
+        id: r.id.clone(),
+        change: change.clone(),
+    };
+    crate::speakers::apply(&mut r, &change);
+    let result = store.append(&event).and_then(|_| store.render(&r, false));
+    drop(r);
+    if let Err(e) = result {
+        warn(
+            recording,
+            store,
+            events,
+            logger,
+            format!("Speaker metadata save failed: {e}. Export before quitting."),
+        );
+        lock(recording).autosave = false;
+    }
+    let _ = events.send(event);
+}
+fn apply_speaker_update(
+    update: crate::speakers::worker::Update,
+    recording: &Arc<Mutex<Recording>>,
+    store: &mut RecordingStore,
+    events: &Sender<PipelineEvent>,
+    logger: &Logger,
+) {
+    let change = match update {
+        crate::speakers::worker::Update::Change(c) => c,
+        crate::speakers::worker::Update::Notice(s) => crate::speakers::Change::Notice(s),
+    };
+    publish_speaker(change, recording, store, events, logger);
+}
+fn drain_speakers(
+    session: &crate::speakers::worker::Session,
+    recording: &Arc<Mutex<Recording>>,
+    store: &mut RecordingStore,
+    events: &Sender<PipelineEvent>,
+    logger: &Logger,
+) {
+    for update in session.updates.try_iter() {
+        apply_speaker_update(update, recording, store, events, logger);
+    }
+}
 fn transcribe_with_capture(
     config: Config,
     recording: Arc<Mutex<Recording>>,
@@ -753,6 +952,7 @@ fn transcribe_with_capture(
         &Config,
         Arc<AtomicBool>,
         Arc<Logger>,
+        Option<crate::speakers::worker::WindowInput>,
     ) -> (Receiver<Segment>, Receiver<String>, JoinHandle<()>),
 ) -> Option<Box<dyn AsrEngine>> {
     let mut sequence = lock(&recording)
@@ -761,8 +961,24 @@ fn transcribe_with_capture(
         .map(|s| s.sequence)
         .max()
         .map_or(0, |s| s + 1);
-    let (rx, warnings_rx, capture_thread) = capture(&config, stop, logger.clone());
+    let mut config = config;
+    config.word_timestamps |= lock(&recording).detect_speakers;
+    let mut speaker_session = if lock(&recording).detect_speakers {
+        Some(crate::speakers::worker::start(
+            config.clone(),
+            lock(&recording).speakers.clone(),
+            offset_ms,
+            logger.clone(),
+        ))
+    } else {
+        None
+    };
+    let input = speaker_session.as_mut().and_then(|s| s.input.take());
+    let (rx, warnings_rx, capture_thread) = capture(&config, stop, logger.clone(), input);
     loop {
+        if let Some(session) = &speaker_session {
+            drain_speakers(session, &recording, &mut store, &events, &logger);
+        }
         let segment = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(segment) => segment,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -809,9 +1025,53 @@ fn transcribe_with_capture(
         let Some(asr) = engine.as_mut() else {
             continue;
         };
-        match asr.transcribe(&segment.samples) {
+        lock(&live).inference = format!("Starting {}", asr.status());
+        let result = if let Some(session) = &speaker_session {
+            // Keep publishing labels while final ASR is busy, without sharing its engine.
+            std::thread::scope(|scope| {
+                let (tx, rx) = bounded(1);
+                let samples = &segment.samples;
+                let asr = &mut **asr;
+                let thread = scope.spawn(move || {
+                    let _ = tx.send(asr.transcribe(samples));
+                });
+                let result = loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(result) => break result,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            break Err(anyhow::anyhow!(
+                                "Transcription worker stopped unexpectedly"
+                            ));
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            drain_speakers(session, &recording, &mut store, &events, &logger);
+                            for warning in warnings_rx.try_iter() {
+                                warn(&recording, &mut store, &events, &logger, warning);
+                            }
+                        }
+                    }
+                };
+                if thread.join().is_err() {
+                    Err(anyhow::anyhow!("Transcription worker stopped unexpectedly"))
+                } else {
+                    result
+                }
+            })
+        } else {
+            asr.transcribe(&segment.samples)
+        };
+        lock(&live).inference = asr.status();
+        for notice in asr.take_notices() {
+            warn(&recording, &mut store, &events, &logger, notice);
+        }
+        match result {
             Ok(result) => {
                 if !result.text.trim().is_empty() {
+                    let start_ms =
+                        offset_ms + segment.start_sample * 1000 / capture::TARGET_RATE as u64;
+                    let end_ms =
+                        offset_ms + segment.end_sample * 1000 / capture::TARGET_RATE as u64;
+                    let timings = crate::speakers::word_timings(&result, start_ms, end_ms);
                     let s = TranscriptSegment {
                         recording_id: lock(&recording).id.clone(),
                         sequence,
@@ -841,6 +1101,21 @@ fn transcribe_with_capture(
                         );
                         lock(&recording).autosave = false;
                     }
+                    if lock(&recording).detect_speakers {
+                        publish_speaker(
+                            crate::speakers::Change::Timings {
+                                sequence: s.sequence,
+                                words: timings,
+                            },
+                            &recording,
+                            &mut store,
+                            &events,
+                            &logger,
+                        );
+                    }
+                    if let Some(session) = &speaker_session {
+                        drain_speakers(session, &recording, &mut store, &events, &logger);
+                    }
                     let render_result = {
                         let r = lock(&recording);
                         store.render(&r, false)
@@ -858,7 +1133,10 @@ fn transcribe_with_capture(
                 }
             }
             Err(e) => {
-                engine = None;
+                // Keep Indonesian fallback on CPU for the remainder of this recording.
+                if config.language == Language::En {
+                    engine = None;
+                }
                 warn(
                     &recording,
                     &mut store,
@@ -871,6 +1149,30 @@ fn transcribe_with_capture(
         lock(&live).finish_chunk(segment.start_sample);
     }
     let _ = capture_thread.join();
+    if let Some(session) = speaker_session {
+        // Draining while waiting also bounds the completion latency and publishes updates.
+        while let Ok(update) = session.updates.recv() {
+            apply_speaker_update(update, &recording, &mut store, &events, &logger);
+        }
+        if session.thread.join().is_err() {
+            publish_speaker(
+                crate::speakers::Change::Notice(
+                    "Speaker worker stopped unexpectedly. Transcription is preserved.".into(),
+                ),
+                &recording,
+                &mut store,
+                &events,
+                &logger,
+            );
+        }
+        publish_speaker(
+            crate::speakers::Change::Finished,
+            &recording,
+            &mut store,
+            &events,
+            &logger,
+        );
+    }
     lock(&live).finish();
     for warning in warnings_rx.try_iter() {
         warn(&recording, &mut store, &events, &logger, warning);
@@ -880,7 +1182,10 @@ fn transcribe_with_capture(
         r.duration_ms = r
             .duration_ms
             .max(r.segments.iter().map(|s| s.end_ms).max().unwrap_or(0));
-        r.status = if r.warnings.is_empty() {
+        r.status = if r.warnings.iter().all(|w| {
+            w.starts_with("NVIDIA inference failed:")
+                || w.starts_with("NVIDIA inference unavailable;")
+        }) {
             RecordingStatus::Completed
         } else {
             RecordingStatus::Incomplete
@@ -907,6 +1212,17 @@ fn transcribe_with_capture(
         r.status = RecordingStatus::Incomplete;
         r.autosave = false;
     }
+    if config.language == Language::Id
+        && lock(&recording)
+            .warnings
+            .iter()
+            .any(|w| w.contains("queue overflowed"))
+    {
+        let gpu = crate::gpu::discover();
+        if let Some(gpu) = gpu.device {
+            let _ = crate::models::save_qualification(&config, &gpu, false, 0.0, 0.0);
+        }
+    }
     let r = lock(&recording);
     let final_event = PipelineEvent::State {
         id: r.id.clone(),
@@ -918,10 +1234,17 @@ fn transcribe_with_capture(
     {
         let mut r = lock(&recording);
         if r.autosave && r.source.is_some() {
-            r.segments.clear();
+            *r = r.metadata();
         }
     }
-    engine
+    if engine
+        .as_ref()
+        .is_some_and(|e| !e.reusable_after_recording())
+    {
+        None
+    } else {
+        engine
+    }
 }
 
 #[cfg(test)]
@@ -978,7 +1301,7 @@ mod tests {
             Arc::new(Mutex::new(String::new())),
             live.clone(),
             Some(Box::new(FailingEngine)),
-            |_, _, _| {
+            |_, _, _, _| {
                 let (tx, rx) = bounded(1);
                 let (_, warnings) = unbounded();
                 let thread = std::thread::spawn(move || {
@@ -1048,7 +1371,7 @@ mod tests {
                     resume: resume_rx,
                     calls: 0,
                 })),
-                |_, stop, _| {
+                |_, stop, _, _| {
                     let (tx, rx) = bounded(2);
                     let (_warning, warnings) = unbounded();
                     let thread = std::thread::spawn(move || {
@@ -1086,6 +1409,78 @@ mod tests {
         assert_eq!(r.segments[2].start_ms, 4000);
         assert!(r.segments.iter().all(|s| s.recording_id == r.id));
         assert_eq!(r.text(false), "Result 1. Result 2. Result 3.");
+    }
+    #[test]
+    fn speaker_failure_is_published_during_delayed_asr_and_preserves_text() {
+        let config = Config {
+            detect_speakers: true,
+            save_transcript: false,
+            speaker_segmentation_model: "missing-speaker-test.onnx".into(),
+            ..Default::default()
+        };
+        let mut record = Recording::new(Language::En, false);
+        record.detect_speakers = true;
+        let recording = Arc::new(Mutex::new(record));
+        let r = recording.clone();
+        let (entered, entered_rx) = bounded(1);
+        let (resume, resume_rx) = bounded(1);
+        let (events, received) = unbounded();
+        let thread = std::thread::spawn(move || {
+            transcribe_with_capture(
+                config,
+                r,
+                0,
+                Arc::new(AtomicBool::new(false)),
+                RecordingStore::new("unused".into()),
+                events,
+                Arc::new(Logger::disabled()),
+                Arc::new(Mutex::new(String::new())),
+                Arc::new(Mutex::new(LiveState::default())),
+                Some(Box::new(DelayedEngine {
+                    entered,
+                    resume: resume_rx,
+                    calls: 0,
+                })),
+                |_, _, _, input| {
+                    let (tx, rx) = bounded(1);
+                    let (_, warnings) = unbounded();
+                    let capture = std::thread::spawn(move || {
+                        drop(input);
+                        tx.send(Segment {
+                            samples: vec![0.5; 320],
+                            sample_rate: 16000,
+                            start_sample: 0,
+                            end_sample: 320,
+                        })
+                        .unwrap();
+                    });
+                    (rx, warnings, capture)
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if matches!(
+                event,
+                PipelineEvent::Speaker {
+                    change: crate::speakers::Change::Notice(_),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        assert!(lock(&recording).segments.is_empty());
+        resume.send(()).unwrap();
+        thread.join().unwrap();
+        let r = lock(&recording);
+        assert!(r.speaker_finished);
+        assert_eq!(r.status, RecordingStatus::Completed);
+        assert_eq!(r.text(false), "Unknown speaker: Result 1.");
     }
     #[test]
     fn finishing_blocks_a_second_start() {
@@ -1219,7 +1614,7 @@ mod continuation_tests {
             Arc::new(Mutex::new(String::new())),
             Arc::new(Mutex::new(LiveState::default())),
             Some(Box::new(AppendingEngine)),
-            |_, _, _| {
+            |_, _, _, _| {
                 let (tx, rx) = bounded(1);
                 let (_, warnings) = unbounded();
                 let thread = std::thread::spawn(move || {
@@ -1422,6 +1817,51 @@ mod deletion_tests {
         );
         let remaining = lock(&records).iter().map(|r| lock(r).clone()).collect();
         (remaining, output.try_iter().collect())
+    }
+    #[test]
+    fn controller_applies_finished_edits_and_rejects_active_edits() {
+        for status in [
+            RecordingStatus::Completed,
+            RecordingStatus::Recording,
+            RecordingStatus::Processing,
+        ] {
+            let mut r = Recording::new(Language::Id, false);
+            r.status = status.clone();
+            r.segments.push(TranscriptSegment {
+                recording_id: r.id.clone(),
+                sequence: 0,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "Original.".into(),
+                clock_time: None,
+            });
+            let request = crate::editing::Request {
+                basis: crate::editing::basis(&r),
+                texts: vec!["Corrected.".into()],
+            };
+            let (tx, rx) = bounded(1);
+            let (remaining, events) = run(
+                r.clone(),
+                vec![Control::CorrectTranscript {
+                    id: r.id.clone(),
+                    request,
+                    result: tx,
+                }],
+            );
+            let succeeded = status == RecordingStatus::Completed;
+            assert_eq!(rx.recv().unwrap().is_ok(), succeeded);
+            assert_eq!(
+                remaining[0].text(false),
+                if succeeded { "Corrected." } else { "Original." }
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, PipelineEvent::TranscriptUpdated { .. }))
+                    .count(),
+                usize::from(succeeded)
+            );
+        }
     }
     #[test]
     fn delete_then_pending_continue_cannot_resurrect_an_unsaved_recording() {

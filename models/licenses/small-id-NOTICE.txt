@@ -1,0 +1,4 @@
+Indonesian Whisper small
+Source: https://huggingface.co/maleo-ai/whisper-small-id
+Revision: 37a5b9a0fa5739e8e859984dabca44337a45fa55
+License: Apache-2.0

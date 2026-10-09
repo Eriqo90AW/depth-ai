@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use rubato::{FftFixedIn, Resampler};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, IAudioCaptureClient, IAudioClient,
-    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eConsole, eRender,
+    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCommunications, eConsole,
+    eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
@@ -30,13 +31,367 @@ pub struct OutputDevice {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    Desktop,
+    Output,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    DefaultSilent,
+    EndpointDisconnected,
+}
 #[derive(Debug, Clone)]
 pub enum CaptureUpdate {
     Source(OutputDevice),
-    Level { packets: u64, peak_db: f32 },
+    Mode {
+        mode: CaptureMode,
+        endpoint: OutputDevice,
+        reason: Option<FallbackReason>,
+    },
+    Level {
+        packets: u64,
+        peak_db: f32,
+    },
     Notice(String),
 }
 type Observer = Box<dyn FnMut(CaptureUpdate) + Send>;
+
+enum CaptureExit {
+    Stopped,
+    Reconnect,
+    Switch(Box<EndpointProbe>),
+}
+
+struct FallbackDetection {
+    last_signal: Instant,
+    last_probe: Option<Instant>,
+}
+impl Default for FallbackDetection {
+    fn default() -> Self {
+        Self {
+            last_signal: Instant::now(),
+            last_probe: None,
+        }
+    }
+}
+impl FallbackDetection {
+    fn signal(&mut self, now: Instant) {
+        self.last_signal = now;
+    }
+    fn reset_silence(&mut self) {
+        self.last_signal = Instant::now();
+    }
+    fn begin_probe(&mut self, now: Instant, stopped: bool) -> bool {
+        if stopped
+            || now.duration_since(self.last_signal) < Duration::from_secs(5)
+            || self
+                .last_probe
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(10))
+        {
+            return false;
+        }
+        self.last_probe = Some(now);
+        true
+    }
+}
+
+#[derive(Default)]
+struct ProbeLevel {
+    peak: f32,
+    previous: Option<f32>,
+    qualified: Option<f32>,
+}
+impl ProbeLevel {
+    fn window(&mut self) {
+        let db = if self.peak > 0.0 {
+            20.0 * self.peak.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
+        if db > -60.0 && self.previous.is_some_and(|previous| previous > -60.0) {
+            self.qualified = Some(db.min(self.previous.unwrap()));
+        }
+        self.previous = Some(db);
+        self.peak = 0.0;
+    }
+}
+
+fn choose_endpoint<'a>(
+    candidates: &'a [(String, f32)],
+    communications: Option<&str>,
+    default: Option<&str>,
+) -> Option<&'a str> {
+    candidates
+        .iter()
+        .min_by(|a, b| {
+            let rank = |id: &str| {
+                if Some(id) == communications {
+                    0
+                } else if Some(id) == default {
+                    1
+                } else {
+                    2
+                }
+            };
+            rank(&a.0)
+                .cmp(&rank(&b.0))
+                .then_with(|| b.1.total_cmp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        })
+        .map(|candidate| candidate.0.as_str())
+}
+
+// Probes own independent WASAPI clients but never a transcription sink or a resampler.
+// Dropping a batch stops every stream, including when Stop or a recovered default cancels it.
+struct EndpointProbe {
+    device: OutputDevice,
+    _resources: CaptureResources,
+    capture: IAudioCaptureClient,
+    mix: MixFormat,
+    mono: Vec<f32>,
+    level: ProbeLevel,
+}
+impl EndpointProbe {
+    unsafe fn open(device: &IMMDevice) -> Result<Self> {
+        unsafe {
+            let description = describe_device(device)?;
+            let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+            let format = client.GetMixFormat()?;
+            let mix_result = read_mix_format(format);
+            let initialized = client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                10_000_000,
+                0,
+                format,
+                None,
+            );
+            CoTaskMemFree(Some(format.cast()));
+            let mix = mix_result?;
+            initialized?;
+            let event = CreateEventW(None, false, false, None)?;
+            let resources = CaptureResources {
+                event,
+                client: client.clone(),
+            };
+            client.SetEventHandle(event)?;
+            let capture = client.GetService()?;
+            client.Start()?;
+            Ok(Self {
+                device: description,
+                _resources: resources,
+                capture,
+                mix,
+                mono: Vec::new(),
+                level: ProbeLevel::default(),
+            })
+        }
+    }
+    unsafe fn poll(&mut self, stop: &AtomicBool) -> Result<()> {
+        unsafe {
+            while !stop.load(Ordering::Relaxed) && self.capture.GetNextPacketSize()? > 0 {
+                let mut data = std::ptr::null_mut();
+                let mut frames = 0;
+                let mut flags = 0;
+                self.capture
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
+                    decode_interleaved(data, frames as usize, &self.mix, &mut self.mono);
+                    for sample in &self.mono {
+                        self.level.peak = self.level.peak.max(sample.abs());
+                    }
+                }
+                self.capture.ReleaseBuffer(frames)?;
+            }
+            Ok(())
+        }
+    }
+}
+trait ProbeAudio {
+    fn id(&self) -> &str;
+    fn level(&mut self) -> &mut ProbeLevel;
+    unsafe fn read(&mut self, stop: &AtomicBool) -> Result<()>;
+}
+impl ProbeAudio for EndpointProbe {
+    fn id(&self) -> &str {
+        &self.device.id
+    }
+    fn level(&mut self) -> &mut ProbeLevel {
+        &mut self.level
+    }
+    unsafe fn read(&mut self, stop: &AtomicBool) -> Result<()> {
+        unsafe { self.poll(stop) }
+    }
+}
+struct ProbeBatch<P = EndpointProbe> {
+    probes: Vec<P>,
+    communications: Option<String>,
+    default: Option<String>,
+    window_at: Instant,
+    windows: u8,
+    finished: bool,
+}
+impl ProbeBatch {
+    unsafe fn open(
+        enumerator: &IMMDeviceEnumerator,
+        stop: &AtomicBool,
+        logger: &Logger,
+    ) -> Result<Self> {
+        unsafe {
+            let endpoint_id = |role| {
+                enumerator
+                    .GetDefaultAudioEndpoint(eRender, role)
+                    .ok()
+                    .and_then(|device| describe_device(&device).ok())
+                    .map(|device| device.id)
+            };
+            let communications = endpoint_id(eCommunications);
+            let default = endpoint_id(eConsole);
+            let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+            let mut probes = Vec::new();
+            for i in 0..devices.GetCount()? {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match devices
+                    .Item(i)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|device| EndpointProbe::open(&device))
+                {
+                    Ok(mut probe) => {
+                        // Discard setup audio before the verification windows begin.
+                        probe.poll(stop)?;
+                        probe.level.peak = 0.0;
+                        probes.push(probe);
+                    }
+                    Err(error) => logger.warn(format!("endpoint probe unavailable: {error:#}")),
+                }
+            }
+            // All clients share the same two one-second verification windows.
+            for probe in &mut probes {
+                probe.poll(stop)?;
+                probe.level.peak = 0.0;
+            }
+            Ok(Self {
+                probes,
+                communications,
+                default,
+                window_at: Instant::now(),
+                windows: 0,
+                finished: false,
+            })
+        }
+    }
+}
+impl<P: ProbeAudio> ProbeBatch<P> {
+    unsafe fn poll(&mut self, stop: &AtomicBool, logger: &Logger) -> Result<Option<P>> {
+        unsafe { self.poll_at(stop, logger, Instant::now()) }
+    }
+    unsafe fn poll_at(
+        &mut self,
+        stop: &AtomicBool,
+        logger: &Logger,
+        now: Instant,
+    ) -> Result<Option<P>> {
+        unsafe {
+            if stop.load(Ordering::Relaxed) {
+                self.finished = true;
+                return Ok(None);
+            }
+            self.probes.retain_mut(|probe| match probe.read(stop) {
+                Ok(()) => true,
+                Err(error) => {
+                    logger.warn(format!(
+                        "probe [{}] failed; keeping current capture: {error:#}",
+                        probe.id()
+                    ));
+                    false
+                }
+            });
+            if now.duration_since(self.window_at) < Duration::from_secs(1) {
+                return Ok(None);
+            }
+            for probe in &mut self.probes {
+                probe.level().window();
+                let peak_db = probe.level().previous.unwrap();
+                logger.info(format!(
+                    "endpoint probe [{}]: peak {:.1} dBFS, window {}",
+                    probe.id(),
+                    peak_db,
+                    self.windows + 1
+                ));
+            }
+            self.windows += 1;
+            self.window_at = now;
+            if self.windows < 2 {
+                return Ok(None);
+            }
+            self.finished = true;
+            let candidates: Vec<_> = self
+                .probes
+                .iter_mut()
+                .filter_map(|probe| {
+                    probe
+                        .level()
+                        .qualified
+                        .map(|level| (probe.id().to_owned(), level))
+                })
+                .collect();
+            let selected = choose_endpoint(
+                &candidates,
+                self.communications.as_deref(),
+                self.default.as_deref(),
+            );
+            Ok(selected
+                .and_then(|id| self.probes.iter().position(|probe| probe.id() == id))
+                .map(|index| self.probes.swap_remove(index)))
+        }
+    }
+}
+
+unsafe fn detect_endpoint(
+    probes: &mut Option<ProbeBatch>,
+    detection: &mut FallbackDetection,
+    enumerator: &IMMDeviceEnumerator,
+    paused: bool,
+    stop: &AtomicBool,
+    logger: &Logger,
+) -> Option<EndpointProbe> {
+    unsafe {
+        if paused || stop.load(Ordering::Relaxed) {
+            *probes = None;
+            detection.reset_silence();
+            return None;
+        }
+        if let Some(batch) = probes {
+            let selected = match batch.poll(stop, logger) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    logger.warn(format!(
+                        "endpoint probes failed; keeping current capture: {error:#}"
+                    ));
+                    *probes = None;
+                    return None;
+                }
+            };
+            if batch.finished {
+                *probes = None;
+            }
+            selected
+        } else {
+            if detection.begin_probe(Instant::now(), false) {
+                match ProbeBatch::open(enumerator, stop, logger) {
+                    Ok(batch) => *probes = Some(batch),
+                    Err(error) => logger.warn(format!(
+                        "endpoint probes failed; keeping current capture: {error:#}"
+                    )),
+                }
+            }
+            None
+        }
+    }
+}
 
 unsafe fn describe_device(device: &IMMDevice) -> Result<OutputDevice> {
     unsafe {
@@ -209,7 +564,7 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for LoopbackActivation_Impl {
     }
 }
 
-unsafe fn activate_desktop_loopback() -> Result<IAudioClient> {
+unsafe fn activate_desktop_loopback(stop: &AtomicBool) -> Result<IAudioClient> {
     use windows::Win32::Media::Audio::{
         AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
@@ -248,10 +603,15 @@ unsafe fn activate_desktop_loopback() -> Result<IAudioClient> {
             &handler,
         )
         .context("activating mute-safe desktop loopback")?;
-        let raw = rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("desktop loopback activation timed out")?
-            .map_err(windows::core::Error::from_hresult)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let raw = loop {
+            anyhow::ensure!(!stop.load(Ordering::Relaxed), "capture cancelled");
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => break result.map_err(windows::core::Error::from_hresult)?,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(error) => return Err(anyhow!("desktop loopback activation failed: {error}")),
+            }
+        };
         Ok(IAudioClient::from_raw(raw as *mut _))
     }
 }
@@ -356,7 +716,7 @@ pub fn run_timed(
 }
 
 pub fn run_timed_selected(
-    mut sink: Box<dyn FnMut(&[f32], u64) + Send>,
+    sink: Box<dyn FnMut(&[f32], u64) + Send>,
     stop: &AtomicBool,
     logger: &Arc<Logger>,
     output_device: Option<&str>,
@@ -365,7 +725,7 @@ pub fn run_timed_selected(
     let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let read = clock.clone();
     run_with_clock(
-        Box::new(move |audio| sink(audio, read.load(Ordering::Acquire))),
+        timed_sink(sink, read),
         None,
         stop,
         logger,
@@ -374,6 +734,20 @@ pub fn run_timed_selected(
         observer,
     )
 }
+fn timed_sink(
+    mut sink: Box<dyn FnMut(&[f32], u64) + Send>,
+    clock: Arc<std::sync::atomic::AtomicU64>,
+) -> Box<dyn FnMut(&[f32]) + Send> {
+    Box::new(move |audio| {
+        let start = clock.load(Ordering::Acquire);
+        sink(audio, start);
+        clock.store(
+            start + (audio.len() as u64 * 1000).div_ceil(TARGET_RATE as u64),
+            Ordering::Release,
+        );
+    })
+}
+
 fn run_with_clock(
     mut sink: Box<dyn FnMut(&[f32]) + Send>,
     paused: Option<&Arc<AtomicBool>>,
@@ -396,22 +770,70 @@ fn run_with_clock(
         windows::Win32::System::Performance::QueryPerformanceCounter(&mut counter)?;
         windows::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency)?;
         let origin_hns = (counter as u128 * 10_000_000 / frequency.max(1) as u128) as u64;
+        let mut selected = output_device.map(str::to_owned);
+        let mut fallback = false;
+        let mut prepared = None;
+        let mut reconnect_reason = None;
+        let mut detection = FallbackDetection::default();
         let result = loop {
+            if stop.load(Ordering::Relaxed) {
+                break Ok(());
+            }
             match capture_inner(
                 &mut sink,
                 paused,
                 stop,
                 logger,
                 clock.as_ref(),
-                output_device,
+                selected.as_deref(),
                 &mut observer,
                 origin_hns,
+                output_device.is_none(),
+                fallback,
+                &mut detection,
+                &mut prepared,
+                reconnect_reason,
             ) {
-                Ok(true) => logger.info("default output changed; reconnecting loopback"),
-                Ok(false) => break Ok(()),
+                Ok(CaptureExit::Switch(probe)) => {
+                    let id = probe.device.id.clone();
+                    prepared = Some(*probe);
+                    logger.info(format!(
+                        "capture transition: default -> output [{id}], default silent"
+                    ));
+                    selected = Some(id);
+                    fallback = true;
+                    reconnect_reason = None;
+                }
+                Ok(CaptureExit::Reconnect) => {
+                    logger.info("capture transition: reconnecting default capture");
+                    selected = None;
+                    fallback = false;
+                    detection.reset_silence();
+                }
+                Ok(CaptureExit::Stopped) => break Ok(()),
+                Err(e) if fallback => {
+                    logger.warn(format!(
+                        "fallback endpoint unavailable; returning to default: {e:#}"
+                    ));
+                    selected = None;
+                    fallback = false;
+                    detection.reset_silence();
+                    reconnect_reason = Some(FallbackReason::EndpointDisconnected);
+                    if let Some(observer) = &mut observer {
+                        observer(CaptureUpdate::Mode {
+                            mode: CaptureMode::Desktop,
+                            endpoint: OutputDevice {
+                                id: String::new(),
+                                name: "Windows default".into(),
+                            },
+                            reason: Some(FallbackReason::EndpointDisconnected),
+                        });
+                    }
+                }
                 Err(e) => break Err(e),
             }
         };
+        drop(prepared);
         if hr.is_ok() {
             CoUninitialize();
         }
@@ -428,7 +850,12 @@ unsafe fn capture_inner(
     output_device: Option<&str>,
     observer: &mut Option<Observer>,
     origin_hns: u64,
-) -> Result<bool> {
+    automatic: bool,
+    fallback: bool,
+    detection: &mut FallbackDetection,
+    prepared: &mut Option<EndpointProbe>,
+    reconnect_reason: Option<FallbackReason>,
+) -> Result<CaptureExit> {
     // SAFETY: all COM calls below run on a thread that initialised COM.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -458,10 +885,16 @@ unsafe fn capture_inner(
         if let Some(observer) = observer {
             observer(CaptureUpdate::Notice(String::new()));
         }
-        let (client, desktop_capture) = if output_device.is_none() {
-            match activate_desktop_loopback() {
+        let verified = prepared.take();
+        let (client, desktop_capture) = if let Some(probe) = &verified {
+            (probe._resources.client.clone(), false)
+        } else if output_device.is_none() {
+            match activate_desktop_loopback(stop) {
                 Ok(client) => (client, true),
                 Err(e) => {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(CaptureExit::Stopped);
+                    }
                     logger.warn(format!(
                         "mute-safe loopback unavailable; using output endpoint: {e:#}"
                     ));
@@ -488,66 +921,92 @@ unsafe fn capture_inner(
         }
         if let Some(observer) = observer {
             observer(CaptureUpdate::Source(source));
-        }
-        let mut desktop_format = WAVEFORMATEX {
-            wFormatTag: 1,
-            nChannels: 2,
-            nSamplesPerSec: 48000,
-            nAvgBytesPerSec: 192000,
-            nBlockAlign: 4,
-            wBitsPerSample: 16,
-            cbSize: 0,
-        };
-        let mix_ptr: *mut WAVEFORMATEX = if desktop_capture {
-            &mut desktop_format
-        } else {
-            client.GetMixFormat().context("reading the mix format")?
-        };
-        // If the format is unreadable the buffer is deliberately leaked: capture cannot proceed
-        // anyway, and it is a few dozen bytes released when the process exits.
-        let mix = read_mix_format(mix_ptr)?;
-
-        // Shared-mode loopback needs a non-zero buffer duration and a zero period. The format
-        // pointer has to stay valid until Initialize has copied it, so it is released *after*
-        // the call — passing a freed pointer yields E_INVALIDARG (0x80070057).
-        let initialised = client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK
-                | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-                | if desktop_capture {
-                    windows::Win32::Media::Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            observer(CaptureUpdate::Mode {
+                mode: if desktop_capture {
+                    CaptureMode::Desktop
                 } else {
-                    0
+                    CaptureMode::Output
                 },
-            if desktop_capture { 0 } else { BUFFER_HNS },
-            0,
-            mix_ptr,
-            None,
-        );
-        // GetMixFormat allocates with CoTaskMemAlloc, so it is released with CoTaskMemFree once
-        // Initialize is finished with it.
-        if !desktop_capture {
-            CoTaskMemFree(Some(mix_ptr as *const core::ffi::c_void));
+                endpoint: description.clone(),
+                reason: if fallback {
+                    Some(FallbackReason::DefaultSilent)
+                } else {
+                    reconnect_reason
+                },
+            });
+            if fallback {
+                observer(CaptureUpdate::Notice(
+                    "Keep this output unmuted while recording.".into(),
+                ));
+            }
         }
-        initialised.context("initialising loopback capture")?;
+        let (mix, _resources, capture) = if let Some(mut probe) = verified {
+            probe.poll(stop)?;
+            (probe.mix, probe._resources, probe.capture)
+        } else {
+            let mut desktop_format = WAVEFORMATEX {
+                wFormatTag: 1,
+                nChannels: 2,
+                nSamplesPerSec: 48000,
+                nAvgBytesPerSec: 192000,
+                nBlockAlign: 4,
+                wBitsPerSample: 16,
+                cbSize: 0,
+            };
+            let mix_ptr: *mut WAVEFORMATEX = if desktop_capture {
+                &mut desktop_format
+            } else {
+                client.GetMixFormat().context("reading the mix format")?
+            };
+            // If the format is unreadable the buffer is deliberately leaked: capture cannot proceed
+            // anyway, and it is a few dozen bytes released when the process exits.
+            let mix = read_mix_format(mix_ptr)?;
 
-        logger.info(format!(
-            "capturing loopback: {} channel(s) at {} Hz, {:?}",
-            mix.channels, mix.rate, mix.format
-        ));
+            // Shared-mode loopback needs a non-zero buffer duration and a zero period. The format
+            // pointer has to stay valid until Initialize has copied it, so it is released *after*
+            // the call — passing a freed pointer yields E_INVALIDARG (0x80070057).
+            let initialised = client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                    | if desktop_capture {
+                        windows::Win32::Media::Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                    } else {
+                        0
+                    },
+                if desktop_capture { 0 } else { BUFFER_HNS },
+                0,
+                mix_ptr,
+                None,
+            );
+            // GetMixFormat allocates with CoTaskMemAlloc, so it is released with CoTaskMemFree once
+            // Initialize is finished with it.
+            if !desktop_capture {
+                CoTaskMemFree(Some(mix_ptr as *const core::ffi::c_void));
+            }
+            initialised.context("initialising loopback capture")?;
 
-        let event: HANDLE =
-            CreateEventW(None, false, false, None).context("creating the audio event")?;
-        let _resources = CaptureResources {
-            event,
-            client: client.clone(),
+            logger.info(format!(
+                "capturing loopback: {} channel(s) at {} Hz, {:?}",
+                mix.channels, mix.rate, mix.format
+            ));
+
+            let event: HANDLE =
+                CreateEventW(None, false, false, None).context("creating the audio event")?;
+            let _resources = CaptureResources {
+                event,
+                client: client.clone(),
+            };
+            client
+                .SetEventHandle(event)
+                .context("registering the audio event")?;
+            let capture: IAudioCaptureClient =
+                client.GetService().context("getting IAudioCaptureClient")?;
+
+            client.Start().context("starting loopback capture")?;
+            (mix, _resources, capture)
         };
-        client
-            .SetEventHandle(event)
-            .context("registering the audio event")?;
-        let capture: IAudioCaptureClient =
-            client.GetService().context("getting IAudioCaptureClient")?;
-
+        let event = _resources.event;
         let mut stage = ResampleStage::new(mix.rate)?;
         let mut mono = Vec::<f32>::with_capacity(4096);
         let mut peak = 0.0f32;
@@ -558,11 +1017,18 @@ unsafe fn capture_inner(
         let mut packets = 0u64;
         let mut meter_peak = 0.0f32;
         let mut meter_at = Instant::now();
-        client.Start().context("starting loopback capture")?;
-        logger.info("loopback capture running");
+        logger.info(format!(
+            "loopback capture running: mode {}, endpoint [{}], fallback {}",
+            if desktop_capture { "desktop" } else { "output" },
+            description.id,
+            fallback
+        ));
 
+        let mut probes: Option<ProbeBatch> = None;
         while !stop.load(Ordering::Relaxed) {
-            let waited = WaitForSingleObject(event, 200);
+            // Also drain on timeout: the default must still be silent when probes qualify,
+            // even if Windows missed an event notification.
+            let _ = WaitForSingleObject(event, 200);
             if meter_at.elapsed() >= Duration::from_secs(1) {
                 let peak_db = if meter_peak > 0.0 {
                     20.0 * meter_peak.log10()
@@ -577,23 +1043,30 @@ unsafe fn capture_inner(
                 }
                 meter_peak = 0.0;
                 meter_at = Instant::now();
+                if fallback {
+                    anyhow::ensure!(
+                        device.GetState()? == DEVICE_STATE_ACTIVE,
+                        "fallback endpoint disconnected"
+                    );
+                }
                 if output_device.is_none() {
                     let current = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
                     if describe_device(&current)?.id != description.id {
                         stage.flush(sink)?;
-                        return Ok(true);
+                        return Ok(CaptureExit::Reconnect);
                     }
                 }
             }
-            if waited != WAIT_OBJECT_0 {
-                continue;
-            }
+
             let now_paused = paused.is_some_and(|p| p.load(Ordering::Relaxed));
             if now_paused {
                 // Drain the device queue without decoding or resampling: the
                 // pipeline discards paused audio anyway. One empty sink call lets
                 // the segmenter observe the pause edge (flush + status update).
                 loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let mut data: *mut u8 = std::ptr::null_mut();
                     let mut frames: u32 = 0;
                     let mut flags: u32 = 0;
@@ -610,6 +1083,8 @@ unsafe fn capture_inner(
                     }
                 }
                 was_paused = true;
+                probes = None;
+                detection.reset_silence();
                 sink(&[]);
                 continue;
             }
@@ -619,6 +1094,9 @@ unsafe fn capture_inner(
                 stage.clear();
             }
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames: u32 = 0;
                 let mut flags: u32 = 0;
@@ -630,7 +1108,7 @@ unsafe fn capture_inner(
                         if let Ok(current) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
                             if describe_device(&current)?.id != description.id {
                                 stage.flush(sink)?;
-                                return Ok(true);
+                                return Ok(CaptureExit::Reconnect);
                             }
                         }
                     }
@@ -653,6 +1131,10 @@ unsafe fn capture_inner(
                             peak = magnitude;
                         }
                     }
+                    if automatic && !fallback && mono.iter().any(|s| s.abs() > 0.001) {
+                        detection.signal(Instant::now());
+                        probes = None;
+                    }
                     if !announced_audio && peak > 0.001 {
                         announced_audio = true;
                         logger.info(format!(
@@ -661,7 +1143,7 @@ unsafe fn capture_inner(
                         ));
                     }
                     if let Some(clock) = clock {
-                        clock.store(
+                        clock.fetch_max(
                             qpc_hns.saturating_sub(origin_hns) / 10_000,
                             Ordering::Release,
                         );
@@ -676,10 +1158,24 @@ unsafe fn capture_inner(
                     _ => break,
                 }
             }
+            if automatic
+                && !fallback
+                && let Some(selected) = detect_endpoint(
+                    &mut probes,
+                    detection,
+                    &enumerator,
+                    paused.is_some_and(|p| p.load(Ordering::Relaxed)),
+                    stop,
+                    logger,
+                )
+            {
+                stage.clear();
+                return Ok(CaptureExit::Switch(Box::new(selected)));
+            }
         }
 
         stage.flush(sink)?;
-        Ok(false)
+        Ok(CaptureExit::Stopped)
     }
 }
 
@@ -896,4 +1392,259 @@ pub fn read_wav(path: &std::path::Path) -> Result<Vec<f32>> {
         mono = out;
     }
     Ok(mono)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    #[test]
+    fn five_seconds_of_default_silence_then_ten_seconds_between_attempts() {
+        let start = Instant::now();
+        let mut detection = FallbackDetection {
+            last_signal: start,
+            last_probe: None,
+        };
+        assert!(!detection.begin_probe(start + Duration::from_millis(4999), false));
+        assert!(detection.begin_probe(start + Duration::from_secs(5), false));
+        // Both failed and all-silent probe batches use this same cooldown.
+        assert!(!detection.begin_probe(start + Duration::from_millis(14999), false));
+        assert!(detection.begin_probe(start + Duration::from_secs(15), false));
+        detection.signal(start + Duration::from_secs(24));
+        assert!(!detection.begin_probe(start + Duration::from_secs(28), false));
+        assert!(detection.begin_probe(start + Duration::from_secs(29), false));
+    }
+    #[test]
+    fn genuine_silence_and_one_window_transients_never_qualify() {
+        for levels in [[0.0, 0.0], [0.02, 0.0], [0.0, 0.02], [0.001, 0.001]] {
+            let mut meter = ProbeLevel::default();
+            for peak in levels {
+                meter.peak = peak;
+                meter.window();
+            }
+            assert!(meter.qualified.is_none());
+        }
+        let mut meter = ProbeLevel::default();
+        for peak in [0.02, 0.01] {
+            meter.peak = peak;
+            meter.window();
+        }
+        assert_eq!(meter.qualified, Some(-40.0));
+    }
+    #[test]
+    fn communications_then_default_then_loudest_then_id() {
+        let candidates = vec![
+            ("z".into(), -30.0),
+            ("a".into(), -30.0),
+            ("regular".into(), -50.0),
+            ("comms".into(), -55.0),
+        ];
+        assert_eq!(
+            choose_endpoint(&candidates, Some("comms"), Some("regular")),
+            Some("comms")
+        );
+        assert_eq!(
+            choose_endpoint(&candidates, Some("absent"), Some("regular")),
+            Some("regular")
+        );
+        assert_eq!(choose_endpoint(&candidates, None, None), Some("a"));
+        assert_eq!(choose_endpoint(&[], None, None), None);
+    }
+    #[test]
+    fn stop_cancels_pending_probe_before_a_window_or_selection() {
+        let start = Instant::now();
+        let mut detection = FallbackDetection {
+            last_signal: start,
+            last_probe: None,
+        };
+        assert!(!detection.begin_probe(start + Duration::from_secs(5), true));
+        assert!(detection.last_probe.is_none());
+        let mut batch: ProbeBatch = ProbeBatch {
+            probes: Vec::new(),
+            communications: None,
+            default: None,
+            window_at: start - Duration::from_secs(2),
+            windows: 1,
+            finished: false,
+        };
+        assert!(
+            unsafe { batch.poll(&AtomicBool::new(true), &Logger::disabled()) }
+                .unwrap()
+                .is_none()
+        );
+        assert!(batch.finished);
+        assert_eq!(batch.windows, 1);
+    }
+    #[test]
+    fn disconnect_restarts_silence_detection_without_bypassing_retry_limit() {
+        let now = Instant::now();
+        let mut detection = FallbackDetection {
+            last_signal: now - Duration::from_secs(30),
+            last_probe: Some(now),
+        };
+        detection.reset_silence();
+        let reset = detection.last_signal;
+        assert!(!detection.begin_probe(reset + Duration::from_secs(4), false));
+        assert!(!detection.begin_probe(reset + Duration::from_secs(5), false));
+        assert!(detection.begin_probe(reset + Duration::from_secs(10), false));
+    }
+    struct FakeProbe {
+        id: String,
+        level: ProbeLevel,
+        windows: std::collections::VecDeque<Option<f32>>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for FakeProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl ProbeAudio for FakeProbe {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn level(&mut self) -> &mut ProbeLevel {
+            &mut self.level
+        }
+        unsafe fn read(&mut self, _: &AtomicBool) -> Result<()> {
+            match self.windows.pop_front().flatten() {
+                Some(peak) => {
+                    self.level.peak = peak;
+                    Ok(())
+                }
+                None => Err(anyhow!("simulated endpoint failure")),
+            }
+        }
+    }
+    #[test]
+    fn failed_probe_is_discarded_and_verified_candidate_is_retained_without_reopening() {
+        let start = Instant::now();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make = |id: &str, windows: Vec<Option<f32>>| FakeProbe {
+            id: id.into(),
+            level: ProbeLevel::default(),
+            windows: windows.into(),
+            drops: drops.clone(),
+        };
+        let mut batch = ProbeBatch {
+            probes: vec![
+                make("failed-comms", vec![None]),
+                make("silent-default", vec![Some(0.0), Some(0.0)]),
+                make("realtek", vec![Some(0.02), Some(0.02)]),
+            ],
+            communications: Some("failed-comms".into()),
+            default: Some("silent-default".into()),
+            window_at: start,
+            windows: 0,
+            finished: false,
+        };
+        let stop = AtomicBool::new(false);
+        assert!(
+            unsafe { batch.poll_at(&stop, &Logger::disabled(), start + Duration::from_secs(1)) }
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        let selected =
+            unsafe { batch.poll_at(&stop, &Logger::disabled(), start + Duration::from_secs(2)) }
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.id(), "realtek");
+        drop(batch);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        drop(selected);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+    #[test]
+    fn all_failed_probes_leave_no_candidate_and_stop_drops_unselected_streams() {
+        let start = Instant::now();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut batch = ProbeBatch {
+            probes: vec![FakeProbe {
+                id: "failed".into(),
+                level: ProbeLevel::default(),
+                windows: vec![None].into(),
+                drops: drops.clone(),
+            }],
+            communications: None,
+            default: None,
+            window_at: start,
+            windows: 0,
+            finished: false,
+        };
+        let stop = AtomicBool::new(false);
+        for second in [1, 2] {
+            assert!(
+                unsafe {
+                    batch.poll_at(
+                        &stop,
+                        &Logger::disabled(),
+                        start + Duration::from_secs(second),
+                    )
+                }
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(batch.finished);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        batch.probes.push(FakeProbe {
+            id: "pending".into(),
+            level: ProbeLevel::default(),
+            windows: vec![Some(0.02)].into(),
+            drops: drops.clone(),
+        });
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            unsafe { batch.poll_at(&stop, &Logger::disabled(), start + Duration::from_secs(3)) }
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batch.probes[0].windows.len(), 1);
+        drop(batch);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+    #[test]
+    fn handover_discards_resampler_tail_and_keeps_clock_and_segments_increasing() {
+        use std::sync::Mutex;
+        let blocks = Arc::new(Mutex::new(Vec::new()));
+        let collected = blocks.clone();
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+        let mut sink = timed_sink(
+            Box::new(move |samples, start| {
+                collected.lock().unwrap().push((start, samples.to_vec()))
+            }),
+            clock.clone(),
+        );
+        let mut old = ResampleStage::new(48000).unwrap();
+        old.push(&vec![0.8; 100], &mut sink).unwrap();
+        old.clear();
+        drop(old);
+        let mut current = ResampleStage::new(TARGET_RATE).unwrap();
+        current.push(&vec![0.1; 16000], &mut sink).unwrap();
+        // A stale packet clock cannot move the sink back across the handover.
+        clock.fetch_max(1100, Ordering::Release);
+        current.push(&vec![0.0; 24000], &mut sink).unwrap();
+        clock.fetch_max(5000, Ordering::Release);
+        current.push(&vec![0.2; 16000], &mut sink).unwrap();
+        current.push(&vec![0.0; 24000], &mut sink).unwrap();
+        let blocks = blocks.lock().unwrap();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(
+            blocks.iter().map(|(start, _)| *start).collect::<Vec<_>>(),
+            [1000, 2000, 5000, 6000]
+        );
+        assert_eq!(
+            blocks.iter().map(|(_, audio)| audio.len()).sum::<usize>(),
+            80000
+        );
+        let mut segmenter = crate::vad::Segmenter::new(crate::vad::SegmenterConfig::default());
+        let mut segments = Vec::new();
+        for (start, audio) in blocks.iter() {
+            segments.extend(segmenter.push_at(audio, start * 16));
+        }
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].end_sample <= segments[1].start_sample);
+        assert!(segments[1].start_sample >= 5000 * 16);
+        assert!(segments[0].samples.iter().all(|sample| *sample != 0.8));
+    }
 }

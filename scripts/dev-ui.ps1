@@ -12,6 +12,10 @@ $env:TMP = $buildTemp
 # the explicitly suffixed rustc output in deps, avoiding an installed/running depth.exe.
 & (Join-Path $PSScriptRoot 'dev-shell.ps1') cmd /c 'cargo rustc --bin depth --features slint/live-preview -- -C extra-filename=-live'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Sherpa's runtime DLLs are copied to target/debug. The dev executable is in
+# deps, so Windows needs the parent directory on this process's DLL search path.
+$runtimeDir = Join-Path $root 'target\debug'
+$env:PATH = "$runtimeDir;$env:PATH"
 $arguments = @('--home', '.scratch/dev')
 if ($Preview) { $arguments += @('--preview-state', $Preview) }
 & (Join-Path $root 'target\debug\deps\depth-live.exe') @arguments

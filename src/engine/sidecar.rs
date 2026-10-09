@@ -58,7 +58,7 @@ impl SidecarEngine {
             logger: logger.clone(),
         };
         engine.set_keywords(&config.keywords);
-        engine.word_timestamps = config.word_timestamps;
+        engine.word_timestamps = config.word_timestamps || config.detect_speakers;
         logger.info(format!(
             "Whistle sidecar ready: {} (model {})",
             engine.exe.display(),
